@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🎙️ SonicFlow AI
+<img src="docs/images/logo-banner.gif" alt="SonicFlow AI — stream voice with ultra-low latency" width="920"/>
+
+# SonicFlow AI
 
 ### *Next-Generation Real-Time Voice Agent Platform*
-
-![SonicFlow AI Logo](https://img.shields.io/badge/SonicFlow-AI-blueviolet?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImEiIHgxPSIwJSIgeTE9IjAlIiB4Mj0iMTAwJSIgeTI9IjEwMCUiPjxzdG9wIG9mZnNldD0iMCUiIHN0b3AtY29sb3I9IiM2NjdlZWEiLz48c3RvcCBvZmZzZXQ9IjEwMCUiIHN0b3AtY29sb3I9IiM3NjRiYTIiLz48L2xpbmVhckdyYWRpZW50PjwvZGVmcz48Y2lyY2xlIGN4PSIxMDAiIGN5PSIxMDAiIHI9IjkwIiBmaWxsPSJ1cmwoI2EpIiBvcGFjaXR5PSIuMiIvPjxjaXJjbGUgY3g9IjEwMCIgY3k9IjEwMCIgcj0iNzAiIGZpbGw9InVybCgjYSkiIG9wYWNpdHk9Ii4zIi8+PGNpcmNsZSBjeD0iMTAwIiBjeT0iMTAwIiByPSI1MCIgZmlsbD0idXJsKCNhKSIvPjwvc3ZnPg==)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-green.svg)](https://www.python.org/)

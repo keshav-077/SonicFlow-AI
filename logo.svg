@@ -1,100 +1,30 @@
-<svg width="400" height="400" viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 220" role="img" aria-label="SonicFlow AI logo">
   <defs>
-    <linearGradient id="gradient1" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#667eea;stop-opacity:1">
-        <animate attributeName="stop-color" values="#667eea;#764ba2;#667eea" dur="3s" repeatCount="indefinite"/>
-      </stop>
-      <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1">
-        <animate attributeName="stop-color" values="#764ba2;#f093fb;#764ba2" dur="3s" repeatCount="indefinite"/>
-      </stop>
+    <linearGradient id="paper" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#fbfaf6"/>
+      <stop offset="100%" stop-color="#f2efe7"/>
     </linearGradient>
-    <linearGradient id="gradient2" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#f093fb;stop-opacity:1"/>
-      <stop offset="100%" style="stop-color:#f5576c;stop-opacity:1"/>
-    </linearGradient>
-    <filter id="glow">
-      <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
-      <feMerge>
-        <feMergeNode in="coloredBlur"/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
   </defs>
-  
-  <!-- Background circles with pulse animation -->
-  <circle cx="200" cy="200" r="180" fill="url(#gradient1)" opacity="0.1">
-    <animate attributeName="r" values="180;190;180" dur="2s" repeatCount="indefinite"/>
-    <animate attributeName="opacity" values="0.1;0.2;0.1" dur="2s" repeatCount="indefinite"/>
-  </circle>
-  <circle cx="200" cy="200" r="140" fill="url(#gradient1)" opacity="0.2">
-    <animate attributeName="r" values="140;150;140" dur="2s" repeatCount="indefinite" begin="0.5s"/>
-    <animate attributeName="opacity" values="0.2;0.3;0.2" dur="2s" repeatCount="indefinite" begin="0.5s"/>
-  </circle>
-  <circle cx="200" cy="200" r="100" fill="url(#gradient1)" opacity="0.3">
-    <animate attributeName="r" values="100;110;100" dur="2s" repeatCount="indefinite" begin="1s"/>
-    <animate attributeName="opacity" values="0.3;0.4;0.3" dur="2s" repeatCount="indefinite" begin="1s"/>
-  </circle>
-  
-  <!-- Central microphone icon -->
-  <g transform="translate(200, 200)" filter="url(#glow)">
-    <!-- Microphone body -->
-    <rect x="-25" y="-50" width="50" height="70" rx="25" fill="url(#gradient1)">
-      <animate attributeName="height" values="70;75;70" dur="1.5s" repeatCount="indefinite"/>
-    </rect>
-    
-    <!-- Microphone stand -->
-    <path d="M -5 25 L -5 55 M 5 25 L 5 55 M -20 55 L 20 55" 
-          stroke="url(#gradient1)" stroke-width="4" stroke-linecap="round" fill="none"/>
-    
-    <!-- Sound waves (left) -->
-    <path d="M -50 -10 Q -60 0 -50 10" stroke="url(#gradient2)" stroke-width="3" 
-          fill="none" stroke-linecap="round" opacity="0">
-      <animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite"/>
-      <animateTransform attributeName="transform" type="translate" 
-                        values="0,0; -10,0; 0,0" dur="2s" repeatCount="indefinite"/>
-    </path>
-    <path d="M -65 -20 Q -80 0 -65 20" stroke="url(#gradient2)" stroke-width="3" 
-          fill="none" stroke-linecap="round" opacity="0">
-      <animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite" begin="0.3s"/>
-      <animateTransform attributeName="transform" type="translate" 
-                        values="0,0; -15,0; 0,0" dur="2s" repeatCount="indefinite" begin="0.3s"/>
-    </path>
-    <path d="M -80 -30 Q -100 0 -80 30" stroke="url(#gradient2)" stroke-width="3" 
-          fill="none" stroke-linecap="round" opacity="0">
-      <animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite" begin="0.6s"/>
-      <animateTransform attributeName="transform" type="translate" 
-                        values="0,0; -20,0; 0,0" dur="2s" repeatCount="indefinite" begin="0.6s"/>
-    </path>
-    
-    <!-- Sound waves (right) -->
-    <path d="M 50 -10 Q 60 0 50 10" stroke="url(#gradient2)" stroke-width="3" 
-          fill="none" stroke-linecap="round" opacity="0">
-      <animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite"/>
-      <animateTransform attributeName="transform" type="translate" 
-                        values="0,0; 10,0; 0,0" dur="2s" repeatCount="indefinite"/>
-    </path>
-    <path d="M 65 -20 Q 80 0 65 20" stroke="url(#gradient2)" stroke-width="3" 
-          fill="none" stroke-linecap="round" opacity="0">
-      <animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite" begin="0.3s"/>
-      <animateTransform attributeName="transform" type="translate" 
-                        values="0,0; 15,0; 0,0" dur="2s" repeatCount="indefinite" begin="0.3s"/>
-    </path>
-    <path d="M 80 -30 Q 100 0 80 30" stroke="url(#gradient2)" stroke-width="3" 
-          fill="none" stroke-linecap="round" opacity="0">
-      <animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite" begin="0.6s"/>
-      <animateTransform attributeName="transform" type="translate" 
-                        values="0,0; 20,0; 0,0" dur="2s" repeatCount="indefinite" begin="0.6s"/>
-    </path>
+  <rect width="960" height="220" fill="url(#paper)"/>
+  <g transform="translate(72,36)">
+    <rect x="0" y="0" width="148" height="148" rx="24" fill="#171a22" opacity="0.06"/>
+    <rect x="8" y="8" width="132" height="132" rx="20" fill="#171a22"/>
+    <g transform="translate(8,8)">
+
+    <!-- waveform bars -->
+    <rect x="22" y="40" width="8" height="40" rx="3" fill="#6c5ce7"><animate attributeName="height" values="12;48;12" dur="1.6s" begin="0.0s" repeatCount="indefinite"/><animate attributeName="y" values="68;32;68" dur="1.6s" begin="0.0s" repeatCount="indefinite"/></rect><rect x="36" y="40" width="8" height="40" rx="3" fill="#a78bfa"><animate attributeName="height" values="12;48;12" dur="1.6s" begin="0.1s" repeatCount="indefinite"/><animate attributeName="y" values="68;32;68" dur="1.6s" begin="0.1s" repeatCount="indefinite"/></rect><rect x="50" y="40" width="8" height="40" rx="3" fill="#6c5ce7"><animate attributeName="height" values="12;48;12" dur="1.6s" begin="0.2s" repeatCount="indefinite"/><animate attributeName="y" values="68;32;68" dur="1.6s" begin="0.2s" repeatCount="indefinite"/></rect><rect x="64" y="40" width="8" height="40" rx="3" fill="#a78bfa"><animate attributeName="height" values="12;48;12" dur="1.6s" begin="0.30000000000000004s" repeatCount="indefinite"/><animate attributeName="y" values="68;32;68" dur="1.6s" begin="0.30000000000000004s" repeatCount="indefinite"/></rect><rect x="78" y="40" width="8" height="40" rx="3" fill="#6c5ce7"><animate attributeName="height" values="12;48;12" dur="1.6s" begin="0.4s" repeatCount="indefinite"/><animate attributeName="y" values="68;32;68" dur="1.6s" begin="0.4s" repeatCount="indefinite"/></rect><rect x="92" y="40" width="8" height="40" rx="3" fill="#a78bfa"><animate attributeName="height" values="12;48;12" dur="1.6s" begin="0.5s" repeatCount="indefinite"/><animate attributeName="y" values="68;32;68" dur="1.6s" begin="0.5s" repeatCount="indefinite"/></rect><rect x="106" y="40" width="8" height="40" rx="3" fill="#6c5ce7"><animate attributeName="height" values="12;48;12" dur="1.6s" begin="0.6000000000000001s" repeatCount="indefinite"/><animate attributeName="y" values="68;32;68" dur="1.6s" begin="0.6000000000000001s" repeatCount="indefinite"/></rect>
+
+      <text x="66" y="92" text-anchor="middle" fill="#fbfaf6" font-family="Georgia, 'Times New Roman', serif" font-size="52" font-weight="500" font-style="italic">S</text>
+      <circle cx="116" cy="28" r="8" fill="#6c5ce7">
+        <animate attributeName="opacity" values="0.5;1;0.5" dur="2s" repeatCount="indefinite"/>
+        <animate attributeName="r" values="7;9;7" dur="2s" repeatCount="indefinite"/>
+      </circle>
+    </g>
   </g>
-  
-  <!-- Text -->
-  <text x="200" y="320" font-family="Arial, sans-serif" font-size="42" font-weight="bold" 
-        fill="url(#gradient1)" text-anchor="middle">
-    SonicFlow AI
-    <animate attributeName="opacity" values="1;0.7;1" dur="3s" repeatCount="indefinite"/>
-  </text>
-  <text x="200" y="350" font-family="Arial, sans-serif" font-size="18" 
-        fill="#666" text-anchor="middle" opacity="0.8">
-    Real-Time Voice Agent
-  </text>
+  <text x="260" y="98" fill="#171a22" font-family="Georgia, 'Times New Roman', serif" font-size="48" font-weight="500" font-style="italic" letter-spacing="-0.02em">SonicFlow AI</text>
+  <text x="262" y="132" fill="#71766f" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" letter-spacing="0.18em">STREAM VOICE WITH ULTRA-LOW LATENCY</text>
+  <rect x="260" y="148" width="0" height="3" rx="1.5" fill="#6c5ce7">
+    <animate attributeName="width" values="0;420;420;0" keyTimes="0;0.45;0.75;1" dur="4s" repeatCount="indefinite"/>
+  </rect>
+  <text x="260" y="178" fill="#454a44" font-family="system-ui, -apple-system, sans-serif" font-size="15">Real-time ASR, LLM, and TTS in one agent loop.</text>
 </svg>
