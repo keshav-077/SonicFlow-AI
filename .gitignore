@@ -1,0 +1,24 @@
+# Local dataset files. Keep app/data source modules tracked.
+/data/
+!/app/data/
+/synthetic-generation/outputs/
+/synthetic-generation/.env
+
+.venv/
+/.env
+.env.compute
+/.cache/compute/
+/.cache/huggingface/
+/.cache/dataset_1_source_manifest.csv
+/.cache/voice_light_before_dataset_restructure.dump
+/.cache/local/
+/logs/compute/
+/run/compute/
+/.runtime/
+/output/
+/tmp/
+/app/local/web/pages/synchronization-review/synchronization-audit.generated.json
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]

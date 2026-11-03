@@ -1,0 +1,943 @@
+from __future__ import annotations
+
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.local.db.models import (
+    DashboardSample,
+    QualityResultRecord,
+    SampleRecord,
+    SampleTrackRecord,
+    TrackSide,
+)
+from app.local.main import app
+from app.local.misalignment_lab.models import (
+    AlignmentReviewCategory,
+    MisalignmentGlobalCountercheckJudgment,
+    MisalignmentGlobalCountercheckStored,
+    MisalignmentJudgment,
+    MisalignmentRepairJudgment,
+    MisalignmentRepairJudgmentRequest,
+    MisalignmentRepairScope,
+    MisalignmentRepairStoredJudgment,
+    MisalignmentStoredJudgment,
+    MisalignmentTransitionLocationSource,
+)
+from app.local.misalignment_lab.router import _validate_repair_transition
+from app.local.misalignment_lab.service import (
+    _candidate_starts,
+    _transition_window,
+    alignment_assessment,
+    build_global_countercheck_queue,
+    build_misalignment_queue,
+    estimate_piecewise_repair,
+    interaction_window_metrics,
+    transition_exclusion_window,
+)
+from app.local.synchronization_review.models import (
+    SynchronizationAuditKind,
+    SynchronizationAuditReport,
+    SynchronizationAuditResult,
+    SynchronizationAuditWindow,
+    SynchronizationEvidenceSource,
+)
+from app.shared.quality import (
+    AnnotationEvidenceSource,
+    AnnotationPoint,
+    AnnotationSpan,
+    ConversationAnnotation,
+    ProcessingStatus,
+    QualityResult,
+    SegmentAnnotationTarget,
+    SpeakerConversationAnnotation,
+    SpeakerSide,
+)
+
+
+@pytest.fixture(scope="module")
+def misalignment_lab_assets() -> Iterator[tuple[str, str]]:
+    with TestClient(app) as client:
+        page_response = client.get("/training/misalignment-lab")
+        script_response = client.get("/pages/misalignment-lab/app.js")
+    assert page_response.status_code == 200
+    assert script_response.status_code == 200
+    yield page_response.text, script_response.text
+
+
+@pytest.mark.parametrize(
+    "required_text",
+    (
+        "Misalignment lab",
+        "Raw tracks - shift 0.0 s",
+        "Plausibly aligned",
+        "Likely misaligned",
+        "Skip / unsure",
+        "Plausibly aligned accepts the recording",
+        "raw waveform",
+        "end of turn",
+        "Test quarantine repairs",
+        "Original 0.0 s",
+        "Try recommended",
+        "Recommended shift fixes it",
+        "Locate the alignment change",
+        "Two-minute transition replay",
+        "estimated change interval",
+        "Save this transition",
+        "No single transition",
+        "Earlier 60 s",
+        "Late shift throughout",
+        "Prediction sounds plausible",
+        "Prediction does not fix it",
+        "Recheck provisional global shifts",
+        "Beginning (first 3 min)",
+        "End of recording",
+        "Raw start + shifted end: needs transition",
+        "Shift works at both: truly global",
+    ),
+)
+def test_misalignment_lab_exposes_rapid_triage_controls(
+    required_text: str,
+    misalignment_lab_assets: tuple[str, str],
+) -> None:
+    page, _ = misalignment_lab_assets
+    assert required_text in page
+
+
+@pytest.mark.parametrize(
+    "required_script",
+    (
+        "QUEUE_SIZE = 50",
+        "/api/misalignment-lab/queue",
+        "/api/misalignment-lab/preview/",
+        "/api/misalignment-lab/judgments",
+        "/api/synchronization-review/audio-window/",
+        'submitJudgment("plausibly_aligned")',
+        'submitJudgment("likely_misaligned")',
+        'submitJudgment("unsure")',
+        "new AudioContext()",
+        "createBufferSource",
+        "source.start(scheduledTime, state.playbackOffsetSeconds)",
+        "Playing both raw tracks on one AudioContext clock",
+        "loadCandidate(state.index + 1, true)",
+        "/pages/shared/annotation-timeline.js",
+        "/api/misalignment-lab/repair-queue",
+        "/api/misalignment-lab/repair-judgments",
+        "speaker2Predicted",
+        "setComparisonShift",
+        "currentOffsetRecommendation",
+        "review_category",
+        "submitRecommendedFix",
+        "/api/misalignment-lab/transition-preview/",
+        "submitPiecewiseTransition",
+        "piecewiseWaveform",
+        "alignmentMode",
+        "shiftTransitionWindow",
+        "search_start_seconds",
+        "change_point_seconds",
+        'judgment: "likely_misaligned"',
+        "/api/misalignment-lab/global-countercheck-queue",
+        "/api/misalignment-lab/global-countercheck-preview/",
+        "/api/misalignment-lab/global-counterchecks",
+        "submitGlobalCountercheck",
+    ),
+)
+def test_misalignment_lab_uses_zero_shift_shared_clock_and_auto_advance(
+    required_script: str,
+    misalignment_lab_assets: tuple[str, str],
+) -> None:
+    _, script = misalignment_lab_assets
+    assert required_script in script
+
+
+def test_interaction_score_rewards_alternating_late_exchange() -> None:
+    quiet = interaction_window_metrics(
+        annotation=_annotation(duration_seconds=600.0, dense_late_exchange=False),
+        start_seconds=570.0,
+        end_seconds=590.0,
+    )
+    dense = interaction_window_metrics(
+        annotation=_annotation(duration_seconds=600.0, dense_late_exchange=True),
+        start_seconds=570.0,
+        end_seconds=590.0,
+    )
+
+    assert dense.alternating_speaker_boundaries >= 4
+    assert dense.rapid_speaker_boundaries >= 4
+    assert dense.backchannel_count == 1
+    assert dense.interaction_score > quiet.interaction_score
+
+
+def test_queue_is_deterministic_unique_and_selects_late_interaction() -> None:
+    samples = tuple(
+        _dashboard_sample(external_id=f"sample_{index:03}", dense_late_exchange=True)
+        for index in range(1, 7)
+    )
+
+    first = build_misalignment_queue(
+        dashboard_samples=samples,
+        audit_report=None,
+        judgments=(),
+        seed="repeatable",
+        limit=5,
+    )
+    second = build_misalignment_queue(
+        dashboard_samples=samples,
+        audit_report=None,
+        judgments=(),
+        seed="repeatable",
+        limit=5,
+    )
+
+    assert first.candidates == second.candidates
+    assert len({candidate.sample_id for candidate in first.candidates}) == 5
+    assert all(candidate.window_start_seconds >= 570.0 for candidate in first.candidates)
+    assert all(candidate.sampling_weight > 0.0 for candidate in first.candidates)
+
+
+def test_short_recording_candidates_stay_in_final_forty_percent() -> None:
+    starts = _candidate_starts(
+        annotation=_annotation(duration_seconds=300.0, dense_late_exchange=False),
+        duration_seconds=300.0,
+    )
+
+    assert min(starts) >= 180.0
+
+
+def test_global_countercheck_compares_first_three_minutes_with_recording_end() -> None:
+    sample = _dashboard_sample(external_id="sample_global", dense_late_exchange=True)
+    provisional_repair = _stored_global_repair(sample=sample, shift_seconds=4.5)
+
+    queue = build_global_countercheck_queue(
+        dashboard_samples=(sample,),
+        audit_report=None,
+        repair_judgments=(provisional_repair,),
+        counterchecks=(),
+    )
+
+    assert len(queue.candidates) == 1
+    candidate = queue.candidates[0]
+    assert candidate.beginning.window_end_seconds <= 180.0
+    assert candidate.ending.window_start_seconds >= 360.0
+    assert candidate.beginning.offset_recommendation is not None
+    assert candidate.ending.offset_recommendation is not None
+    assert candidate.beginning.offset_recommendation.shift_seconds == 4.5
+    assert candidate.ending.offset_recommendation.shift_seconds == 4.5
+    assert queue.exclusion_policy.manual_margin_seconds == 10.0
+    assert queue.exclusion_policy.automatic_margin_seconds == 60.0
+
+
+def test_global_countercheck_progress_keeps_provisional_repair_separate() -> None:
+    sample = _dashboard_sample(external_id="sample_global_reviewed", dense_late_exchange=True)
+    provisional_repair = _stored_global_repair(sample=sample, shift_seconds=-1.5)
+    initial = build_global_countercheck_queue(
+        dashboard_samples=(sample,),
+        audit_report=None,
+        repair_judgments=(provisional_repair,),
+        counterchecks=(),
+    )
+    candidate = initial.candidates[0]
+    now = datetime.now(UTC)
+    countercheck = MisalignmentGlobalCountercheckStored(
+        sample_id=sample.sample.id,
+        external_id=sample.sample.external_id,
+        beginning_candidate_id=candidate.beginning.candidate_id,
+        ending_candidate_id=candidate.ending.candidate_id,
+        beginning_start_seconds=candidate.beginning.window_start_seconds,
+        beginning_end_seconds=candidate.beginning.window_end_seconds,
+        ending_start_seconds=candidate.ending.window_start_seconds,
+        ending_end_seconds=candidate.ending.window_end_seconds,
+        predicted_shift_seconds=-1.5,
+        estimator_version="test-global",
+        judgment=MisalignmentGlobalCountercheckJudgment.NEEDS_TRANSITION,
+        created_at=now,
+        updated_at=now,
+    )
+
+    reviewed = build_global_countercheck_queue(
+        dashboard_samples=(sample,),
+        audit_report=None,
+        repair_judgments=(provisional_repair,),
+        counterchecks=(countercheck,),
+    )
+
+    assert reviewed.progress.reviewed_count == 1
+    assert reviewed.progress.needs_transition_count == 1
+    assert reviewed.candidates[0].provisional_repair == provisional_repair
+    assert reviewed.candidates[0].stored_judgment == countercheck
+
+
+def test_candidate_identity_changes_when_audio_is_replaced() -> None:
+    original = _dashboard_sample(external_id="sample_200", dense_late_exchange=True)
+    replacement_tracks = (
+        original.tracks[0],
+        original.tracks[1].model_copy(update={"audio_sha256": "3" * 64}),
+    )
+    replacement = original.model_copy(update={"tracks": replacement_tracks})
+
+    original_queue = build_misalignment_queue(
+        dashboard_samples=(original,),
+        audit_report=None,
+        judgments=(),
+        seed="audio-revision",
+        limit=1,
+    )
+    replacement_queue = build_misalignment_queue(
+        dashboard_samples=(replacement,),
+        audit_report=None,
+        judgments=(),
+        seed="audio-revision",
+        limit=1,
+    )
+
+    assert original_queue.candidates[0].candidate_id != replacement_queue.candidates[0].candidate_id
+
+
+def test_likely_misaligned_judgment_quarantines_whole_session() -> None:
+    samples = (
+        _dashboard_sample(external_id="sample_201", dense_late_exchange=True),
+        _dashboard_sample(external_id="sample_202", dense_late_exchange=True),
+    )
+    initial = build_misalignment_queue(
+        dashboard_samples=samples,
+        audit_report=None,
+        judgments=(),
+        seed="quarantine",
+        limit=2,
+    )
+    rejected = initial.candidates[0]
+    judgment = _stored_judgment(
+        candidate_id=rejected.candidate_id,
+        sample_id=rejected.sample_id,
+        external_id=rejected.external_id,
+        judgment=MisalignmentJudgment.LIKELY_MISALIGNED,
+    )
+
+    remaining = build_misalignment_queue(
+        dashboard_samples=samples,
+        audit_report=None,
+        judgments=(judgment,),
+        seed="quarantine",
+        limit=2,
+    )
+
+    assert all(candidate.sample_id != rejected.sample_id for candidate in remaining.candidates)
+    assert remaining.progress.quarantined_session_count == 1
+
+
+def test_aligned_judgment_accepts_session_and_removes_it_from_queue() -> None:
+    sample = _dashboard_sample(external_id="sample_203", dense_late_exchange=True)
+    initial = build_misalignment_queue(
+        dashboard_samples=(sample,),
+        audit_report=None,
+        judgments=(),
+        seed="aligned",
+        limit=1,
+    )
+    reviewed = initial.candidates[0]
+    judgment = _stored_judgment(
+        candidate_id=reviewed.candidate_id,
+        sample_id=reviewed.sample_id,
+        external_id=reviewed.external_id,
+        judgment=MisalignmentJudgment.PLAUSIBLY_ALIGNED,
+    )
+
+    later = build_misalignment_queue(
+        dashboard_samples=(sample,),
+        audit_report=None,
+        judgments=(judgment,),
+        seed="aligned",
+        limit=1,
+    )
+
+    assert later.candidates == ()
+    assert later.progress.plausibly_aligned_count == 1
+    assert later.progress.quarantined_session_count == 0
+
+
+def test_unsure_judgment_resamples_session_with_a_different_exchange() -> None:
+    sample = _dashboard_sample(external_id="sample_204", dense_late_exchange=True)
+    initial = build_misalignment_queue(
+        dashboard_samples=(sample,),
+        audit_report=None,
+        judgments=(),
+        seed="unsure",
+        limit=1,
+    )
+    reviewed = initial.candidates[0]
+    judgment = _stored_judgment(
+        candidate_id=reviewed.candidate_id,
+        sample_id=reviewed.sample_id,
+        external_id=reviewed.external_id,
+        judgment=MisalignmentJudgment.UNSURE,
+    )
+
+    later = build_misalignment_queue(
+        dashboard_samples=(sample,),
+        audit_report=None,
+        judgments=(judgment,),
+        seed="unsure",
+        limit=1,
+    )
+
+    assert len(later.candidates) == 1
+    assert later.candidates[0].sample_id == reviewed.sample_id
+    assert later.candidates[0].candidate_id != reviewed.candidate_id
+    assert (
+        later.candidates[0].window_end_seconds <= reviewed.window_start_seconds
+        or later.candidates[0].window_start_seconds >= reviewed.window_end_seconds
+    )
+    assert later.progress.unsure_count == 1
+
+
+def test_unsure_session_is_deprioritized_behind_unreviewed_session() -> None:
+    unsure_sample = _dashboard_sample(external_id="sample_204", dense_late_exchange=True)
+    unreviewed_sample = _dashboard_sample(external_id="sample_205", dense_late_exchange=True)
+    initial = build_misalignment_queue(
+        dashboard_samples=(unsure_sample,),
+        audit_report=None,
+        judgments=(),
+        seed="unsure",
+        limit=1,
+    )
+    reviewed = initial.candidates[0]
+    judgment = _stored_judgment(
+        candidate_id=reviewed.candidate_id,
+        sample_id=reviewed.sample_id,
+        external_id=reviewed.external_id,
+        judgment=MisalignmentJudgment.UNSURE,
+    )
+
+    later = build_misalignment_queue(
+        dashboard_samples=(unsure_sample, unreviewed_sample),
+        audit_report=None,
+        judgments=(judgment,),
+        seed="unsure",
+        limit=2,
+    )
+
+    assert later.candidates[0].sample_id == unreviewed_sample.sample.id
+
+
+def test_piecewise_repair_estimate_requires_stable_distinct_second_part() -> None:
+    sample_id = uuid4()
+    estimate = estimate_piecewise_repair(
+        audit_result=_audit_result(
+            sample_id=sample_id,
+            suffix_shifts=(4.0, 4.2, 4.3, 4.1, 4.2, 4.4),
+        )
+    )
+
+    assert estimate is not None
+    assert estimate.first_part_shift_seconds == 0.0
+    assert estimate.predicted_second_part_shift_seconds == 4.2
+    assert estimate.shift_change_seconds == 4.2
+    assert estimate.supporting_window_count == 6
+    assert estimate.stable_second_part_duration_seconds == 480.0
+    assert estimate.conservative_first_part_end_seconds == 240.0
+    assert estimate.conservative_second_part_start_seconds == 780.0
+
+
+def test_transition_window_is_two_minutes_and_stays_inside_shifted_audio() -> None:
+    centered = _transition_window(
+        duration_seconds=1_200.0,
+        center_seconds=600.0,
+        first_shift_seconds=0.0,
+        second_shift_seconds=4.0,
+    )
+    near_start = _transition_window(
+        duration_seconds=1_200.0,
+        center_seconds=20.0,
+        first_shift_seconds=0.0,
+        second_shift_seconds=4.0,
+    )
+
+    assert centered == (540.0, 660.0)
+    assert near_start == (4.0, 124.0)
+
+
+@pytest.mark.parametrize(
+    ("location_source", "expected_start", "expected_end"),
+    (
+        (MisalignmentTransitionLocationSource.MANUAL, 490.0, 510.0),
+        (MisalignmentTransitionLocationSource.AUTOMATIC, 440.0, 560.0),
+    ),
+)
+def test_transition_exclusion_depends_on_location_source(
+    location_source: MisalignmentTransitionLocationSource,
+    expected_start: float,
+    expected_end: float,
+) -> None:
+    exclusion = transition_exclusion_window(
+        change_point_seconds=500.0,
+        duration_seconds=1_000.0,
+        location_source=location_source,
+    )
+
+    assert exclusion.start_seconds == expected_start
+    assert exclusion.end_seconds == expected_end
+
+
+def test_transition_exclusion_clamps_to_recording_bounds() -> None:
+    exclusion = transition_exclusion_window(
+        change_point_seconds=30.0,
+        duration_seconds=100.0,
+        location_source=MisalignmentTransitionLocationSource.AUTOMATIC,
+    )
+
+    assert exclusion.start_seconds == 0.0
+    assert exclusion.end_seconds == 90.0
+
+
+def test_piecewise_repair_requires_confirmed_change_point() -> None:
+    audit_result = _audit_result(
+        sample_id=uuid4(),
+        suffix_shifts=(4.0, 4.2, 4.3, 4.1, 4.2, 4.4),
+    )
+    estimate = estimate_piecewise_repair(audit_result=audit_result)
+    assert estimate is not None
+    confirmed = MisalignmentRepairJudgmentRequest(
+        sample_id=audit_result.sample_id,
+        candidate_id=uuid4(),
+        predicted_shift_seconds=estimate.predicted_second_part_shift_seconds,
+        estimator_version=estimate.estimator_version,
+        repair_scope=MisalignmentRepairScope.AFTER_CHANGE_POINT,
+        first_part_shift_seconds=estimate.first_part_shift_seconds,
+        change_point_seconds=(
+            estimate.conservative_first_part_end_seconds + estimate.stable_second_part_end_seconds
+        )
+        / 2.0,
+        change_interval_start_seconds=estimate.conservative_first_part_end_seconds,
+        change_interval_end_seconds=estimate.stable_second_part_end_seconds,
+        transition_confirmed=True,
+        judgment=MisalignmentRepairJudgment.PLAUSIBLE,
+    )
+    missing_location = confirmed.model_copy(
+        update={"change_point_seconds": None, "transition_confirmed": False}
+    )
+
+    _validate_repair_transition(request=confirmed, audit_result=audit_result)
+    with pytest.raises(ValueError, match="confirmed transition point"):
+        _validate_repair_transition(request=missing_location, audit_result=audit_result)
+
+    outside_midpoint_hint = confirmed.model_copy(
+        update={
+            "change_point_seconds": estimate.stable_second_part_end_seconds - 1.0,
+        }
+    )
+    outside_conservative_range = confirmed.model_copy(
+        update={
+            "change_point_seconds": estimate.stable_second_part_end_seconds + 1.0,
+        }
+    )
+    _validate_repair_transition(request=outside_midpoint_hint, audit_result=audit_result)
+    with pytest.raises(ValueError, match="outside the supported review interval"):
+        _validate_repair_transition(
+            request=outside_conservative_range,
+            audit_result=audit_result,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "suffix_shifts", "expected_category", "expected_shift", "expected_scope"),
+    (
+        (
+            SynchronizationAuditKind.STABLE_OFFSET,
+            (0.18, 0.21, 0.24, 0.20),
+            AlignmentReviewCategory.LIKELY_ALIGNED,
+            0.21,
+            MisalignmentRepairScope.GLOBAL_OFFSET,
+        ),
+        (
+            SynchronizationAuditKind.STABLE_OFFSET,
+            (3.9, 4.0, 4.1, 4.0),
+            AlignmentReviewCategory.LIKELY_CONSTANT_OFFSET,
+            4.0,
+            MisalignmentRepairScope.AFTER_CHANGE_POINT,
+        ),
+        (
+            SynchronizationAuditKind.TEMPORAL_CHANGE,
+            (4.0, 4.2, 4.3, 4.1, 4.2, 4.4),
+            AlignmentReviewCategory.LIKELY_CONSTANT_OFFSET,
+            4.2,
+            MisalignmentRepairScope.AFTER_CHANGE_POINT,
+        ),
+        (
+            SynchronizationAuditKind.TEMPORAL_CHANGE,
+            (4.0, 5.5, 4.0, 5.5, 4.0),
+            AlignmentReviewCategory.NON_CONSTANT_OR_UNCERTAIN,
+            None,
+            None,
+        ),
+    ),
+)
+def test_alignment_assessment_labels_and_recommends_only_safe_offsets(
+    kind: SynchronizationAuditKind,
+    suffix_shifts: tuple[float, ...],
+    expected_category: AlignmentReviewCategory,
+    expected_shift: float | None,
+    expected_scope: MisalignmentRepairScope | None,
+) -> None:
+    assessment = alignment_assessment(
+        _audit_result(
+            sample_id=uuid4(),
+            suffix_shifts=suffix_shifts,
+            kind=kind,
+        )
+    )
+
+    assert assessment.category is expected_category
+    assert (
+        assessment.recommendation.shift_seconds if assessment.recommendation is not None else None
+    ) == expected_shift
+    assert (
+        assessment.recommendation.repair_scope if assessment.recommendation is not None else None
+    ) is expected_scope
+
+
+def test_queue_orders_aligned_then_one_offset_then_non_constant() -> None:
+    aligned = _dashboard_sample(external_id="sample_aligned", dense_late_exchange=True)
+    constant = _dashboard_sample(external_id="sample_constant", dense_late_exchange=True)
+    variable = _dashboard_sample(external_id="sample_variable", dense_late_exchange=True)
+    audit_report = SynchronizationAuditReport(
+        estimator_version="test",
+        window_duration_seconds=180.0,
+        window_hop_seconds=60.0,
+        analyzed_session_count=3,
+        generated_at="2026-07-20T00:00:00Z",
+        results=(
+            _audit_result(
+                sample_id=aligned.sample.id,
+                suffix_shifts=(0.18, 0.21, 0.24, 0.20),
+                kind=SynchronizationAuditKind.STABLE_OFFSET,
+            ),
+            _audit_result(
+                sample_id=constant.sample.id,
+                suffix_shifts=(3.9, 4.0, 4.1, 4.0),
+                kind=SynchronizationAuditKind.STABLE_OFFSET,
+            ),
+            _audit_result(
+                sample_id=variable.sample.id,
+                suffix_shifts=(4.0, 5.5, 4.0, 5.5, 4.0),
+                kind=SynchronizationAuditKind.TEMPORAL_CHANGE,
+            ),
+        ),
+    )
+
+    queue = build_misalignment_queue(
+        dashboard_samples=(variable, constant, aligned),
+        audit_report=audit_report,
+        judgments=(),
+        seed="category-order",
+        limit=3,
+    )
+
+    assert [candidate.review_category for candidate in queue.candidates] == [
+        AlignmentReviewCategory.LIKELY_ALIGNED,
+        AlignmentReviewCategory.LIKELY_CONSTANT_OFFSET,
+        AlignmentReviewCategory.NON_CONSTANT_OR_UNCERTAIN,
+    ]
+
+
+@pytest.mark.parametrize(
+    "suffix_shifts",
+    (
+        (4.0, 4.1, 4.2),
+        (0.3, 0.4, 0.2, 0.3, 0.4),
+        (4.0, 5.5, 4.0, 5.5, 4.0),
+    ),
+)
+def test_piecewise_repair_estimate_rejects_insufficient_or_unstable_suffix(
+    suffix_shifts: tuple[float, ...],
+) -> None:
+    estimate = estimate_piecewise_repair(
+        audit_result=_audit_result(
+            sample_id=uuid4(),
+            suffix_shifts=suffix_shifts,
+        )
+    )
+
+    assert estimate is None
+
+
+def _dashboard_sample(external_id: str, dense_late_exchange: bool) -> DashboardSample:
+    sample_id = uuid4()
+    annotation = _annotation(
+        duration_seconds=600.0,
+        dense_late_exchange=dense_late_exchange,
+    )
+    quality_result = QualityResult(
+        metric_version="test",
+        sample_id=str(sample_id),
+        status=ProcessingStatus.COMPLETED,
+        speaker1_uri="speaker1.wav",
+        speaker2_uri="speaker2.wav",
+        duration_seconds=600.0,
+        interaction_density=None,
+        timing_reliability=None,
+        audio_quality=None,
+        conversation_annotation=annotation,
+        conversation_count_estimate=None,
+        event_candidates=(),
+        raw_quality_score=1.0,
+        quality_flags=(),
+        total_quality_score=1.0,
+        error=None,
+    )
+    now = datetime.now(UTC)
+    tracks = tuple(
+        SampleTrackRecord(
+            id=uuid4(),
+            sample_id=sample_id,
+            side=side,
+            speaker_index=speaker_index,
+            storage_uri=f"{side.value}.wav",
+            access_uri=f"{side.value}.wav",
+            duration_seconds=600.0,
+            sample_rate=48_000,
+            channels=1,
+            sample_count=28_800_000,
+            audio_sha256=str(speaker_index) * 64,
+            created_at=now,
+            updated_at=now,
+        )
+        for side, speaker_index in (
+            (TrackSide.SPEAKER1, 1),
+            (TrackSide.SPEAKER2, 2),
+        )
+    )
+    return DashboardSample(
+        sample=SampleRecord(
+            id=sample_id,
+            dataset_id=uuid4(),
+            external_id=external_id,
+            duration_seconds=600.0,
+            quality_score=1.0,
+            quality_flags=(),
+            is_unusable=False,
+            created_at=now,
+            updated_at=now,
+        ),
+        tracks=tracks,
+        latest_quality=QualityResultRecord.model_construct(
+            payload=quality_result.model_dump(mode="json")
+        ),
+        latest_asr_run=None,
+        latest_asr_evaluation=None,
+        language_assessments=(),
+    )
+
+
+def _annotation(
+    duration_seconds: float,
+    dense_late_exchange: bool,
+) -> ConversationAnnotation:
+    if dense_late_exchange:
+        speaker1_segments = (
+            _segment(571.0, 573.0, "one"),
+            _segment(575.0, 577.0, "three"),
+            _segment(579.0, 581.0, "five"),
+        )
+        speaker2_segments = (
+            _segment(573.1, 574.8, "two"),
+            _segment(577.1, 578.8, "four"),
+            _segment(581.1, 583.0, "six"),
+        )
+        speaker2_backchannels = (
+            AnnotationSpan(start_seconds=584.0, end_seconds=584.5, text="mhm"),
+        )
+    else:
+        speaker1_segments = (_segment(571.0, 581.0, "long monologue"),)
+        speaker2_segments = ()
+        speaker2_backchannels = ()
+    speaker1 = _speaker(
+        side=SpeakerSide.SPEAKER1,
+        segments=speaker1_segments,
+        backchannels=(),
+    )
+    speaker2 = _speaker(
+        side=SpeakerSide.SPEAKER2,
+        segments=speaker2_segments,
+        backchannels=speaker2_backchannels,
+    )
+    return ConversationAnnotation(
+        annotation_version="full-duration-test-v1",
+        analyzed_duration_seconds=duration_seconds,
+        speaker1=speaker1,
+        speaker2=speaker2,
+        speech_segment_count=len(speaker1_segments) + len(speaker2_segments),
+        turn_count=len(speaker1.turns) + len(speaker2.turns),
+        turn_taking_count=5 if dense_late_exchange else 0,
+        interaction_count=5 if dense_late_exchange else 0,
+        pause_count=0,
+        backchannel_count=len(speaker2_backchannels),
+        interruption_count=0,
+        usable_event_count=6 if dense_late_exchange else 1,
+        events_per_hour=36.0,
+        speaker_balance_score=1.0,
+        quality_score=1.0,
+    )
+
+
+def _speaker(
+    side: SpeakerSide,
+    segments: tuple[SegmentAnnotationTarget, ...],
+    backchannels: tuple[AnnotationSpan, ...],
+) -> SpeakerConversationAnnotation:
+    speech_segments = tuple(
+        AnnotationSpan(
+            start_seconds=segment.start_seconds,
+            end_seconds=segment.end_seconds,
+            text=segment.text,
+        )
+        for segment in segments
+    )
+    return SpeakerConversationAnnotation(
+        side=side,
+        speech_segments=speech_segments,
+        pauses=(),
+        backchannels=backchannels,
+        turns=tuple(
+            AnnotationPoint(
+                time_seconds=segment.end_seconds,
+                confidence=0.9,
+                text=segment.text,
+            )
+            for segment in segments
+        ),
+        interruptions=(),
+        segment_targets=segments,
+        connection_targets=(),
+        speech_duration_seconds=sum(
+            segment.end_seconds - segment.start_seconds for segment in speech_segments
+        ),
+        pause_duration_seconds=0.0,
+        backchannel_duration_seconds=sum(
+            segment.end_seconds - segment.start_seconds for segment in backchannels
+        ),
+    )
+
+
+def _segment(
+    start_seconds: float,
+    end_seconds: float,
+    text: str,
+) -> SegmentAnnotationTarget:
+    return SegmentAnnotationTarget(
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        text=text,
+        evidence_source=AnnotationEvidenceSource.TRANSCRIPT,
+        keep_playing_confidence=0.1,
+        turn_confidence=0.9,
+        interruption_confidence=0.0,
+    )
+
+
+def _stored_judgment(
+    candidate_id: UUID,
+    sample_id: UUID,
+    external_id: str,
+    judgment: MisalignmentJudgment,
+) -> MisalignmentStoredJudgment:
+    now = datetime.now(UTC)
+    return MisalignmentStoredJudgment(
+        candidate_id=candidate_id,
+        sample_id=sample_id,
+        external_id=external_id,
+        window_start_seconds=570.0,
+        window_end_seconds=590.0,
+        judgment=judgment,
+        queue_seed="test",
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _stored_global_repair(
+    sample: DashboardSample,
+    shift_seconds: float,
+) -> MisalignmentRepairStoredJudgment:
+    now = datetime.now(UTC)
+    return MisalignmentRepairStoredJudgment(
+        sample_id=sample.sample.id,
+        candidate_id=uuid4(),
+        external_id=sample.sample.external_id,
+        predicted_shift_seconds=shift_seconds,
+        estimator_version="test-global",
+        repair_scope=MisalignmentRepairScope.GLOBAL_OFFSET,
+        first_part_shift_seconds=None,
+        change_point_seconds=None,
+        change_interval_start_seconds=None,
+        change_interval_end_seconds=None,
+        transition_confirmed=True,
+        judgment=MisalignmentRepairJudgment.PLAUSIBLE,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _audit_result(
+    sample_id: UUID,
+    suffix_shifts: tuple[float, ...],
+    kind: SynchronizationAuditKind = SynchronizationAuditKind.TEMPORAL_CHANGE,
+) -> SynchronizationAuditResult:
+    prefix = tuple(
+        _audit_window(
+            start_seconds=float(index * 60),
+            shift_seconds=0.0,
+            accepted=False,
+            confidence_score=0.0,
+        )
+        for index in range(5)
+    )
+    suffix = tuple(
+        _audit_window(
+            start_seconds=600.0 + float(index * 60),
+            shift_seconds=shift_seconds,
+            accepted=True,
+            confidence_score=0.9,
+        )
+        for index, shift_seconds in enumerate(suffix_shifts)
+    )
+    return SynchronizationAuditResult(
+        sample_id=sample_id,
+        external_id="sample_test",
+        kind=kind,
+        anomaly_score=0.9,
+        strongest_window_start_seconds=600.0,
+        strongest_window_end_seconds=780.0,
+        strongest_shift_seconds=suffix_shifts[0],
+        temporal_shift_range_seconds=abs(suffix_shifts[0]),
+        summary="test",
+        windows=(*prefix, *suffix),
+    )
+
+
+def _audit_window(
+    start_seconds: float,
+    shift_seconds: float,
+    accepted: bool,
+    confidence_score: float,
+) -> SynchronizationAuditWindow:
+    return SynchronizationAuditWindow(
+        start_seconds=start_seconds,
+        end_seconds=start_seconds + 180.0,
+        estimated_b_shift_seconds=shift_seconds,
+        confidence_score=confidence_score,
+        bad_state_improvement=0.02 if accepted else 0.0,
+        competing_margin=0.01,
+        basin_width_seconds=0.12,
+        persistence_window_count=4 if accepted else 0,
+        agreeing_transcript_sources=(
+            SynchronizationEvidenceSource.PARAKEET,
+            SynchronizationEvidenceSource.CANARY,
+        )
+        if accepted
+        else (),
+        accepted=accepted,
+        maximum_lag_boundary=False,
+    )

@@ -1,0 +1,455 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import ParamSpec, TypeVar
+
+from app.compute.asr.models.registry import AsrModelCache
+from app.compute.config import VoiceStackSettings
+from app.compute.voice.admission import SingleVoiceSessionAdmission, VoiceSessionLease
+from app.compute.voice.conversation import ModelUserMessage
+from app.compute.voice.interfaces import (
+    LanguageModelRequest,
+    SpeechSynthesizer,
+    SpeechUnderstandingProvider,
+    SynthesisWord,
+    TextGenerator,
+)
+from app.compute.voice.models import VllmLanguageModel, VllmTextGenerator
+from app.compute.voice.nemotron_client import (
+    NemotronStreamingTranscriber,
+    NemotronTurnPredictionProvider,
+)
+from app.compute.voice.schemas import (
+    CapturedAudioChunk,
+    PlaybackCondition,
+    PlaybackConditionAuthority,
+    PlaybackState,
+    SileroEvidence,
+)
+from app.compute.voice.search import SearchProvider, create_search_provider
+from app.compute.voice.speech_detection import SileroSpeechDetectorFactory
+from app.compute.voice.speech_understanding import CompositeSpeechUnderstandingProvider
+from app.compute.voice.tts_selection import create_speech_synthesizer
+from app.shared.audio.s3 import S3AudioCache, default_s3_downloader
+from app.shared.compute_api import ModelStage, ModelStageStatus, ModelWarmupStatus
+from app.shared.model_constants import NEMOTRON_ASR_MODEL_NAME, NEMOTRON_ASR_MODEL_REVISION
+
+logger = logging.getLogger(__name__)
+ModelType = TypeVar("ModelType")
+LoaderParameters = ParamSpec("LoaderParameters")
+
+
+@dataclass
+class MutableModelStage:
+    name: str
+    status: ModelStageStatus = ModelStageStatus.PENDING
+    load_time_seconds: float | None = None
+    error: str | None = None
+    warmup_status: ModelWarmupStatus = ModelWarmupStatus.NOT_REQUIRED
+    warmup_time_seconds: float | None = None
+    warmup_error: str | None = None
+
+    def snapshot(self) -> ModelStage:
+        return ModelStage(
+            name=self.name,
+            status=self.status,
+            load_time_seconds=self.load_time_seconds,
+            error=self.error,
+            warmup_status=self.warmup_status,
+            warmup_time_seconds=self.warmup_time_seconds,
+            warmup_error=self.warmup_error,
+        )
+
+
+class ComputeRuntime:
+    def __init__(
+        self,
+        voice_stack_settings: VoiceStackSettings | None,
+        dataset_audio_cache_directory: Path,
+    ) -> None:
+        self.voice_stack_settings = voice_stack_settings
+        self.dataset_audio_cache = S3AudioCache(
+            root=dataset_audio_cache_directory,
+            downloader=default_s3_downloader(),
+        )
+        self.streaming_asr_stage = MutableModelStage(
+            "streaming_asr", warmup_status=ModelWarmupStatus.PENDING
+        )
+        self.speech_detection_stage = MutableModelStage("speech_detection")
+        self.language_model_stage = MutableModelStage(
+            "language_model", warmup_status=ModelWarmupStatus.PENDING
+        )
+        self.search_summarizer_stage = MutableModelStage("search_summarizer")
+        self.speech_synthesis_stage = MutableModelStage(
+            "speech_synthesis", warmup_status=ModelWarmupStatus.PENDING
+        )
+        self.batch_asr_models = AsrModelCache()
+        self.voice_session_admission = SingleVoiceSessionAdmission()
+        self.speech_understanding_provider: SpeechUnderstandingProvider | None = None
+        self.speech_detector_factory: SileroSpeechDetectorFactory | None = None
+        self.language_model: VllmLanguageModel | None = None
+        self.search_text_generator: TextGenerator | None = None
+        self.speech_synthesizer: SpeechSynthesizer | None = None
+        self.search_provider: SearchProvider | None = (
+            None
+            if voice_stack_settings is None
+            else create_search_provider(voice_stack_settings.search)
+        )
+        self.loading_task: asyncio.Task[None] | None = None
+        self.model_loading_started = False
+
+    @property
+    def ready(self) -> bool:
+        return not self.voice_enabled or self.voice_ready
+
+    @property
+    def voice_enabled(self) -> bool:
+        return self.voice_stack_settings is not None
+
+    @property
+    def voice_ready(self) -> bool:
+        return self.voice_enabled and all(
+            stage.status is ModelStageStatus.READY for stage in self._voice_stages()
+        )
+
+    def stages(self) -> tuple[ModelStage, ...]:
+        if self.voice_stack_settings is None:
+            return ()
+        return tuple(stage.snapshot() for stage in self._voice_stages())
+
+    def try_admit_voice_session(self, request_id: str) -> VoiceSessionLease | None:
+        return self.voice_session_admission.try_acquire(request_id)
+
+    def release_voice_session(self, lease: VoiceSessionLease) -> None:
+        self.voice_session_admission.release(lease)
+
+    def start_loading(self) -> None:
+        assert not self.model_loading_started
+        self.model_loading_started = True
+        if self.voice_stack_settings is None:
+            logger.info("voice stack disabled; batch ASR is ready")
+            return
+        self.loading_task = asyncio.create_task(self._load_models())
+
+    async def load_before_memory_snapshot(self) -> None:
+        assert not self.model_loading_started
+        assert self.voice_stack_settings is not None
+        self.model_loading_started = True
+        await self._load_language_model()
+        await self._load_search_text_generator()
+        await self.prepare_for_memory_snapshot()
+
+    async def load_after_memory_snapshot(self) -> None:
+        await self.restore_after_memory_snapshot()
+        await self._load_speech_detector()
+        await asyncio.gather(
+            self._load_streaming_asr(),
+            self._load_speech_synthesizer(),
+        )
+        await asyncio.gather(
+            self._warm_streaming_asr(),
+            self._warm_language_model(),
+        )
+        await self._warm_speech_synthesizer()
+        logger.info("all required compute models ready")
+
+    async def wait_until_loading_complete(self) -> None:
+        if self.loading_task is not None:
+            await self.loading_task
+
+    async def shutdown(self) -> None:
+        if self.loading_task is not None and not self.loading_task.done():
+            self.loading_task.cancel()
+            try:
+                await self.loading_task
+            except asyncio.CancelledError:
+                pass
+        if self.speech_understanding_provider is not None:
+            await asyncio.to_thread(self.speech_understanding_provider.close)
+        if self.language_model is not None:
+            await asyncio.to_thread(self.language_model.close)
+        if (
+            self.search_text_generator is not None
+            and self.search_text_generator is not self.language_model
+        ):
+            await asyncio.to_thread(self.search_text_generator.close)
+        if self.speech_synthesizer is not None:
+            await asyncio.to_thread(self.speech_synthesizer.close)
+        if self.search_provider is not None:
+            await self.search_provider.close()
+        logger.info("compute runtime shutdown complete")
+
+    async def prepare_for_memory_snapshot(self) -> None:
+        language_model = self.require_language_model()
+        search_text_generator = self.require_search_text_generator()
+        await asyncio.to_thread(language_model.sleep)
+        try:
+            await asyncio.to_thread(search_text_generator.sleep)
+        except BaseException:
+            await asyncio.to_thread(language_model.wake)
+            raise
+
+    async def restore_after_memory_snapshot(self) -> None:
+        await asyncio.to_thread(self.require_language_model().wake)
+        await asyncio.to_thread(self.require_search_text_generator().wake)
+
+    def require_speech_understanding_provider(self) -> SpeechUnderstandingProvider:
+        if self.speech_understanding_provider is None:
+            raise RuntimeError("Speech understanding is not ready.")
+        return self.speech_understanding_provider
+
+    def require_speech_detector_factory(self) -> SileroSpeechDetectorFactory:
+        if self.speech_detector_factory is None:
+            raise RuntimeError("Speech detector is not ready.")
+        return self.speech_detector_factory
+
+    def require_language_model(self) -> VllmLanguageModel:
+        if self.language_model is None:
+            raise RuntimeError("Language model is not ready.")
+        return self.language_model
+
+    def require_search_text_generator(self) -> TextGenerator:
+        if self.search_text_generator is None:
+            raise RuntimeError("Search summarizer is not ready.")
+        return self.search_text_generator
+
+    def require_speech_synthesizer(self) -> SpeechSynthesizer:
+        if self.speech_synthesizer is None:
+            raise RuntimeError("Speech synthesizer is not ready.")
+        return self.speech_synthesizer
+
+    def require_search_provider(self) -> SearchProvider:
+        if self.search_provider is None:
+            raise RuntimeError("Search provider is not ready.")
+        return self.search_provider
+
+    async def _load_models(self) -> None:
+        started = time.perf_counter()
+        await self._load_speech_detector()
+        primary_loads = (
+            self._load_and_warm(
+                self._load_streaming_asr,
+                self._warm_streaming_asr,
+            ),
+            self._load_and_warm(
+                self._load_language_model,
+                self._warm_language_model,
+            ),
+            self._load_and_warm(
+                self._load_speech_synthesizer,
+                self._warm_speech_synthesizer,
+            ),
+        )
+        settings = self.voice_stack_settings
+        if settings is not None and not settings.share_language_model_for_search:
+            await asyncio.gather(*primary_loads, self._load_search_text_generator())
+        else:
+            await asyncio.gather(*primary_loads)
+            await self._load_search_text_generator()
+        logger.info(
+            "all required compute models ready in %.3f seconds",
+            time.perf_counter() - started,
+        )
+
+    async def _load_and_warm(
+        self,
+        load_model: Callable[[], Awaitable[None]],
+        warm_model: Callable[[], Awaitable[None]],
+    ) -> None:
+        await load_model()
+        await warm_model()
+
+    async def _load_speech_detector(self) -> None:
+        factory = await self._timed_load(
+            self.speech_detection_stage,
+            SileroSpeechDetectorFactory,
+        )
+        if factory is not None:
+            self.speech_detector_factory = factory
+
+    async def _load_streaming_asr(self) -> None:
+        transcriber = await self._timed_load(
+            self.streaming_asr_stage,
+            NemotronStreamingTranscriber,
+        )
+        if transcriber is not None:
+            self.speech_understanding_provider = CompositeSpeechUnderstandingProvider(
+                transcriber=transcriber,
+                turn_prediction_provider=(
+                    NemotronTurnPredictionProvider(transcriber)
+                    if transcriber.turn_adapter_available
+                    else None
+                ),
+                asr_model_name=NEMOTRON_ASR_MODEL_NAME,
+                asr_model_revision=NEMOTRON_ASR_MODEL_REVISION,
+            )
+
+    async def _load_language_model(self) -> None:
+        model = await self._timed_load(
+            self.language_model_stage,
+            VllmLanguageModel,
+        )
+        if model is not None:
+            self.language_model = model
+
+    async def _load_search_text_generator(self) -> None:
+        assert self.voice_stack_settings is not None
+        if self.voice_stack_settings.share_language_model_for_search:
+            self.search_text_generator = self.require_language_model()
+            self.search_summarizer_stage.status = ModelStageStatus.READY
+            self.search_summarizer_stage.load_time_seconds = 0.0
+            logger.info("search summarizer shares the language model worker")
+            return
+        generator = await self._timed_load(
+            self.search_summarizer_stage,
+            VllmTextGenerator,
+        )
+        if generator is not None:
+            self.search_text_generator = generator
+
+    async def _load_speech_synthesizer(self) -> None:
+        assert self.voice_stack_settings is not None
+        model = await self._timed_load(
+            self.speech_synthesis_stage,
+            create_speech_synthesizer,
+            self.voice_stack_settings.speech_synthesis,
+        )
+        if model is not None:
+            self.speech_synthesizer = model
+
+    async def _warm_streaming_asr(self) -> None:
+        provider = self.speech_understanding_provider
+        if provider is None:
+            return
+        session = provider.create_session(stream_epoch=1)
+
+        async def warm() -> None:
+            try:
+                observed_at = time.monotonic_ns()
+                sample_count = 16_000
+                await session.add_audio(
+                    CapturedAudioChunk(
+                        pcm16=bytes(sample_count * 2),
+                        sequence_number=0,
+                        start_input_sample=0,
+                        end_input_sample=sample_count,
+                        monotonic_observation_time_ns=observed_at,
+                        stream_epoch=1,
+                        turn_epoch=1,
+                        silero_evidence=SileroEvidence(
+                            is_speech=False, monotonic_time_ns=observed_at
+                        ),
+                        playback_condition=PlaybackCondition(
+                            event_id="startup-warmup",
+                            state=PlaybackState.IDLE,
+                            assistant_audible=False,
+                            latest_output_sample_position=0,
+                            latest_source_sample_position=0,
+                            monotonic_time_ns=observed_at,
+                            authority=PlaybackConditionAuthority.SERVER_ESTIMATED,
+                        ),
+                    )
+                )
+                await session.finalize_turn()
+            finally:
+                await session.close()
+
+        await self._timed_warmup(self.streaming_asr_stage, warm)
+
+    async def _warm_language_model(self) -> None:
+        model = self.language_model
+        if model is None:
+            return
+
+        async def warm() -> None:
+            request = LanguageModelRequest(
+                assistant_generation_id=1,
+                messages=(ModelUserMessage(content="Reply only with OK."),),
+                tools=(),
+            )
+            async for _event in model.stream_response(request):
+                pass
+
+        await self._timed_warmup(self.language_model_stage, warm)
+
+    async def _warm_speech_synthesizer(self) -> None:
+        synthesizer = self.speech_synthesizer
+        if synthesizer is None:
+            return
+        session = synthesizer.start_session()
+
+        async def warm() -> None:
+            try:
+                await session.add_word(SynthesisWord(text="Ready.", text_start=0, text_end=6))
+                await session.finish_input()
+                async for _event in session.stream_events():
+                    pass
+            finally:
+                await session.cancel()
+
+        await self._timed_warmup(self.speech_synthesis_stage, warm)
+
+    async def _timed_warmup(
+        self,
+        stage: MutableModelStage,
+        warmup: Callable[[], Awaitable[None]],
+    ) -> None:
+        stage.warmup_status = ModelWarmupStatus.RUNNING
+        logger.info("model warmup started: %s", stage.name)
+        started = time.perf_counter()
+        try:
+            await asyncio.wait_for(warmup(), timeout=30.0)
+        except Exception as error:
+            stage.status = ModelStageStatus.FAILED
+            stage.warmup_status = ModelWarmupStatus.FAILED
+            stage.warmup_error = str(error)
+            logger.exception("model warmup failed: %s", stage.name)
+        else:
+            stage.warmup_status = ModelWarmupStatus.READY
+            logger.info(
+                "model warmup completed: %s in %.3f seconds",
+                stage.name,
+                time.perf_counter() - started,
+            )
+        finally:
+            stage.warmup_time_seconds = time.perf_counter() - started
+
+    async def _timed_load(
+        self,
+        stage: MutableModelStage,
+        loader: Callable[LoaderParameters, ModelType],
+        *loader_arguments: LoaderParameters.args,
+    ) -> ModelType | None:
+        stage.status = ModelStageStatus.LOADING
+        logger.info("model load started: %s", stage.name)
+        started = time.perf_counter()
+        try:
+            model = await asyncio.to_thread(loader, *loader_arguments)
+        except Exception as error:
+            stage.status = ModelStageStatus.FAILED
+            stage.error = str(error)
+            stage.load_time_seconds = time.perf_counter() - started
+            logger.exception("model load failed: %s", stage.name)
+            return None
+        stage.status = ModelStageStatus.READY
+        stage.load_time_seconds = time.perf_counter() - started
+        logger.info(
+            "model load completed: %s in %.3f seconds",
+            stage.name,
+            stage.load_time_seconds,
+        )
+        return model
+
+    def _voice_stages(self) -> tuple[MutableModelStage, ...]:
+        return (
+            self.speech_detection_stage,
+            self.streaming_asr_stage,
+            self.language_model_stage,
+            self.search_summarizer_stage,
+            self.speech_synthesis_stage,
+        )

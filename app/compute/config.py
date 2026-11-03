@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+from app.compute.voice.search import SearchSettings, search_settings_from_environment
+from app.compute.voice.tts_selection import SpeechSynthesisSettings
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+@dataclass(frozen=True)
+class VoiceStackSettings:
+    speech_synthesis: SpeechSynthesisSettings
+    search: SearchSettings
+    share_language_model_for_search: bool = False
+
+
+@dataclass(frozen=True)
+class ComputeSettings:
+    token: str
+    log_directory: Path
+    dataset_audio_cache_directory: Path
+    voice_stack: VoiceStackSettings | None
+    eager_model_loading: bool = False
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str]) -> ComputeSettings:
+        token = environment.get("VOICE_LIGHT_COMPUTE_TOKEN", "")
+        if not token:
+            raise ValueError("VOICE_LIGHT_COMPUTE_TOKEN is required.")
+        log_directory = Path(environment.get("VOICE_LIGHT_COMPUTE_LOG_DIR", "logs/compute"))
+        voice_stack_enabled = _parse_boolean_setting(
+            environment=environment,
+            name="VOICE_LIGHT_VOICE_STACK_ENABLED",
+            default=True,
+        )
+        return cls(
+            token=token,
+            log_directory=log_directory,
+            dataset_audio_cache_directory=Path(
+                environment.get(
+                    "VOICE_LIGHT_DATASET_AUDIO_CACHE_DIR",
+                    ".cache/compute/dataset-audio",
+                )
+            ),
+            voice_stack=(
+                VoiceStackSettings(
+                    speech_synthesis=SpeechSynthesisSettings.from_environment(
+                        environment,
+                        REPOSITORY_ROOT,
+                    ),
+                    search=search_settings_from_environment(environment),
+                    share_language_model_for_search=_parse_boolean_setting(
+                        environment=environment,
+                        name="VOICE_LIGHT_SHARE_LANGUAGE_MODEL_FOR_SEARCH",
+                        default=False,
+                    ),
+                )
+                if voice_stack_enabled
+                else None
+            ),
+            eager_model_loading=_parse_boolean_setting(
+                environment=environment,
+                name="VOICE_LIGHT_EAGER_MODEL_LOADING",
+                default=False,
+            ),
+        )
+
+
+def _parse_boolean_setting(
+    environment: Mapping[str, str],
+    name: str,
+    default: bool,
+) -> bool:
+    value = environment.get(name)
+    if value is None:
+        return default
+    match value.strip().lower():
+        case "true":
+            return True
+        case "false":
+            return False
+        case _:
+            raise ValueError(f"{name} must be either 'true' or 'false'.")

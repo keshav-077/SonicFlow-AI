@@ -1,0 +1,611 @@
+from __future__ import annotations
+
+import ast
+import asyncio
+import math
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Annotated, Literal, Protocol
+from zoneinfo import ZoneInfo
+
+from pydantic import ConfigDict, Field, TypeAdapter, field_validator
+
+from app.compute.voice.search_debug import SearchDebugTrace, SearchToolOutput
+from app.shared.base_model import FrozenBaseModel
+
+MAXIMUM_ABSOLUTE_INTEGER_RESULT = 10**100
+MAXIMUM_ABSOLUTE_FLOAT_RESULT = 1e100
+MAXIMUM_ABSOLUTE_EXPONENT = 100
+MAXIMUM_CALCULATION_RESULTS = 8
+MAXIMUM_SEARCH_QUERY_CHARACTERS = 240
+
+
+class ToolName(StrEnum):
+    SEARCH = "search"
+    CALCULATE = "calculate"
+    GET_TIME = "get_time"
+
+
+class ToolCallFailureReason(StrEnum):
+    MALFORMED_JSON = "malformed_json"
+    UNKNOWN_TOOL = "unknown_tool"
+    INVALID_ARGUMENTS = "invalid_arguments"
+    DUPLICATE_CALL = "duplicate_call"
+    MULTIPLE_CALLS = "multiple_calls"
+    INCOMPLETE_CALL = "incomplete_call"
+    UNEXPECTED_CONTENT = "unexpected_content"
+
+
+class ToolExecutionFailureReason(StrEnum):
+    HANDLER_FAILURE = "handler_failure"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    INVALIDATED = "invalidated"
+
+
+class ToolLifecycle(StrEnum):
+    NOT_REQUESTED = "not_requested"
+    CALL_BUFFERING = "call_buffering"
+    READY = "ready"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    INVALIDATED = "invalidated"
+
+
+class ToolResultCommitStatus(StrEnum):
+    NOT_STAGED = "not_staged"
+    STAGED = "staged"
+    GENERATION_LOCAL_COMMITTED = "generation_local_committed"
+    SESSION_COMMITTED = "session_committed"
+    DISCARDED = "discarded"
+
+
+class ToolResultDelivery(StrEnum):
+    MODEL_CONTINUATION = "model_continuation"
+    DIRECT_SPEECH = "direct_speech"
+
+
+class ToolInvalidationReason(StrEnum):
+    USER_ACTIVITY = "user_activity"
+    RESPONSE_REQUIRING_OVERLAP = "response_requiring_overlap"
+    SPECULATIVE_INVALIDATION = "speculative_invalidation"
+    GENERATION_FAILURE = "generation_failure"
+    SESSION_STOPPED = "session_stopped"
+    PLAYBACK_RESUME_REJECTED = "playback_resume_rejected"
+
+
+class SearchArguments(FrozenBaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    query: str = Field(min_length=1, max_length=MAXIMUM_SEARCH_QUERY_CHARACTERS)
+
+
+class CalculateArguments(FrozenBaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    expression: str = Field(min_length=1, max_length=160)
+
+
+class GetTimeArguments(FrozenBaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    time_zone_names: tuple[Annotated[str, Field(min_length=1, max_length=64)], ...] = Field(
+        default=(), max_length=8
+    )
+
+    @field_validator("time_zone_names")
+    @classmethod
+    def validate_time_zone_names(cls, names: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(names)) != len(names):
+            raise ValueError("Time-zone names must be unique.")
+        for name in names:
+            try:
+                ZoneInfo(name)
+            except (KeyError, ValueError) as error:
+                raise ValueError(f"Unknown IANA time-zone name: {name}") from error
+        return names
+
+
+class ToolStringParameter(FrozenBaseModel):
+    type: Literal["string"] = "string"
+    description: str
+
+
+class ToolStringArrayParameter(FrozenBaseModel):
+    type: Literal["array"] = "array"
+    items: ToolStringParameter
+    description: str
+    minItems: int = Field(default=1, ge=1)
+    maxItems: int = Field(default=8, ge=1)
+
+
+class SearchParameterProperties(FrozenBaseModel):
+    query: ToolStringParameter
+
+
+class SearchParameters(FrozenBaseModel):
+    type: Literal["object"] = "object"
+    properties: SearchParameterProperties
+    required: tuple[Literal["query"], ...] = ("query",)
+    additionalProperties: Literal[False] = False
+
+
+class CalculateParameterProperties(FrozenBaseModel):
+    expression: ToolStringParameter
+
+
+class CalculateParameters(FrozenBaseModel):
+    type: Literal["object"] = "object"
+    properties: CalculateParameterProperties
+    required: tuple[Literal["expression"], ...] = ("expression",)
+    additionalProperties: Literal[False] = False
+
+
+class GetTimeParameterProperties(FrozenBaseModel):
+    time_zone_names: ToolStringArrayParameter
+
+
+class GetTimeParameters(FrozenBaseModel):
+    type: Literal["object"] = "object"
+    properties: GetTimeParameterProperties
+    required: tuple[()] = ()
+    additionalProperties: Literal[False] = False
+
+
+class SearchToolFunctionSpecification(FrozenBaseModel):
+    name: Literal[ToolName.SEARCH] = ToolName.SEARCH
+    description: str
+    parameters: SearchParameters
+
+
+class CalculateToolFunctionSpecification(FrozenBaseModel):
+    name: Literal[ToolName.CALCULATE] = ToolName.CALCULATE
+    description: str
+    parameters: CalculateParameters
+
+
+class GetTimeToolFunctionSpecification(FrozenBaseModel):
+    name: Literal[ToolName.GET_TIME] = ToolName.GET_TIME
+    description: str
+    parameters: GetTimeParameters
+
+
+ToolFunctionSpecification = Annotated[
+    SearchToolFunctionSpecification
+    | CalculateToolFunctionSpecification
+    | GetTimeToolFunctionSpecification,
+    Field(discriminator="name"),
+]
+
+
+class ToolSpecification(FrozenBaseModel):
+    type: Literal["function"] = "function"
+    function: ToolFunctionSpecification
+
+
+class SearchToolCallFunction(FrozenBaseModel):
+    name: Literal[ToolName.SEARCH] = ToolName.SEARCH
+    arguments: SearchArguments
+
+
+class CalculateToolCallFunction(FrozenBaseModel):
+    name: Literal[ToolName.CALCULATE] = ToolName.CALCULATE
+    arguments: CalculateArguments
+
+
+class GetTimeToolCallFunction(FrozenBaseModel):
+    name: Literal[ToolName.GET_TIME] = ToolName.GET_TIME
+    arguments: GetTimeArguments
+
+
+ToolCallFunction = Annotated[
+    SearchToolCallFunction | CalculateToolCallFunction | GetTimeToolCallFunction,
+    Field(discriminator="name"),
+]
+
+
+class ToolCall(FrozenBaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: ToolCallFunction
+
+
+class SerializedToolCall(FrozenBaseModel):
+    id: str
+    name: str
+    arguments_json: str
+
+
+class ToolCallFailure(FrozenBaseModel):
+    call_id: str
+    reason: ToolCallFailureReason
+    message: str
+    attempted_tool_name: str | None
+
+
+class ToolSuccess(FrozenBaseModel):
+    outcome: Literal["success"] = "success"
+    call_id: str
+    tool_name: ToolName
+    result: str
+    delivery: ToolResultDelivery = Field(
+        default=ToolResultDelivery.MODEL_CONTINUATION,
+        exclude=True,
+    )
+
+
+class ToolExecutionFailure(FrozenBaseModel):
+    outcome: Literal["failure"] = "failure"
+    call_id: str
+    tool_name: ToolName | None
+    reason: ToolCallFailureReason | ToolExecutionFailureReason
+    message: str
+
+
+ToolOutcome = Annotated[
+    ToolSuccess | ToolExecutionFailure,
+    Field(discriminator="outcome"),
+]
+tool_outcome_adapter: TypeAdapter[ToolOutcome] = TypeAdapter(ToolOutcome)
+
+
+class ToolCallAdmission(StrEnum):
+    ALLOWED = "allowed"
+    DUPLICATE = "duplicate"
+
+
+class SearchToolAvailability(StrEnum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass
+class ToolCircuitBreaker:
+    successful_calls: list[ToolCall] = field(default_factory=list)
+
+    def admit(self, call: ToolCall) -> ToolCallAdmission:
+        if any(previous.function == call.function for previous in self.successful_calls):
+            return ToolCallAdmission.DUPLICATE
+        return ToolCallAdmission.ALLOWED
+
+    def record(self, call: ToolCall, outcome: ToolSuccess | ToolExecutionFailure) -> None:
+        if isinstance(outcome, ToolSuccess):
+            self.successful_calls.append(call)
+
+
+def tool_failure_spoken_response(outcome: ToolExecutionFailure) -> str:
+    match outcome.tool_name:
+        case ToolName.SEARCH:
+            return "I can't access live search right now."
+        case ToolName.CALCULATE:
+            return "I couldn't complete that calculation."
+        case ToolName.GET_TIME:
+            return "I couldn't get the current time."
+        case None:
+            return "I couldn't complete that tool request."
+
+
+SearchToolHandler = Callable[[SearchArguments], Awaitable[str | SearchToolOutput]]
+CalculateToolHandler = Callable[[CalculateArguments], Awaitable[str]]
+CurrentTimeProvider = Callable[[], datetime]
+
+
+class SearchAnswerer(Protocol):
+    async def answer(self, query: str) -> str | SearchToolOutput: ...
+
+
+class GetTimeToolHandler(Protocol):
+    def set_local_time_zone(self, time_zone_name: str) -> None: ...
+
+    async def __call__(self, arguments: GetTimeArguments) -> str: ...
+
+
+class ToolExecutor(Protocol):
+    @property
+    def specifications(self) -> tuple[ToolSpecification, ...]: ...
+
+    @property
+    def search_availability(self) -> SearchToolAvailability: ...
+
+    def validate(self, request: SerializedToolCall) -> ToolCall | ToolCallFailure: ...
+
+    def configure_session(self, local_time_zone: str) -> None: ...
+
+    def take_search_debug_trace(self, call_id: str) -> SearchDebugTrace | None: ...
+
+    async def execute(self, call: ToolCall) -> ToolSuccess | ToolExecutionFailure: ...
+
+
+class RuntimeToolRegistry:
+    def __init__(
+        self,
+        search_handler: SearchToolHandler | None,
+        calculate_handler: CalculateToolHandler,
+        get_time_handler: GetTimeToolHandler,
+    ) -> None:
+        self.search_handler = search_handler
+        self.calculate_handler = calculate_handler
+        self.get_time_handler = get_time_handler
+        self._specifications = tuple(
+            specification
+            for specification in _tool_specifications()
+            if search_handler is not None or specification.function.name is not ToolName.SEARCH
+        )
+        self._search_debug_traces: dict[str, SearchDebugTrace] = {}
+
+    @property
+    def specifications(self) -> tuple[ToolSpecification, ...]:
+        return self._specifications
+
+    @property
+    def search_availability(self) -> SearchToolAvailability:
+        if self.search_handler is None:
+            return SearchToolAvailability.UNAVAILABLE
+        return SearchToolAvailability.AVAILABLE
+
+    def validate(self, request: SerializedToolCall) -> ToolCall | ToolCallFailure:
+        try:
+            match request.name:
+                case ToolName.SEARCH:
+                    if self.search_handler is None:
+                        return ToolCallFailure(
+                            call_id=request.id,
+                            reason=ToolCallFailureReason.UNKNOWN_TOOL,
+                            message="Search is not configured.",
+                            attempted_tool_name=request.name,
+                        )
+                    function: ToolCallFunction = SearchToolCallFunction(
+                        arguments=SearchArguments.model_validate_json(request.arguments_json)
+                    )
+                case ToolName.CALCULATE:
+                    function = CalculateToolCallFunction(
+                        arguments=CalculateArguments.model_validate_json(request.arguments_json)
+                    )
+                case ToolName.GET_TIME:
+                    function = GetTimeToolCallFunction(
+                        arguments=GetTimeArguments.model_validate_json(request.arguments_json)
+                    )
+                case _:
+                    return ToolCallFailure(
+                        call_id=request.id,
+                        reason=ToolCallFailureReason.UNKNOWN_TOOL,
+                        message=f"Unknown tool: {request.name}",
+                        attempted_tool_name=request.name,
+                    )
+        except ValueError as error:
+            return ToolCallFailure(
+                call_id=request.id,
+                reason=ToolCallFailureReason.INVALID_ARGUMENTS,
+                message=f"Invalid {request.name} arguments: {error}",
+                attempted_tool_name=request.name,
+            )
+        return ToolCall(id=request.id, function=function)
+
+    def configure_session(self, local_time_zone: str) -> None:
+        self.get_time_handler.set_local_time_zone(local_time_zone)
+
+    def take_search_debug_trace(self, call_id: str) -> SearchDebugTrace | None:
+        return self._search_debug_traces.pop(call_id, None)
+
+    async def execute(self, call: ToolCall) -> ToolSuccess | ToolExecutionFailure:
+        delivery = ToolResultDelivery.MODEL_CONTINUATION
+        try:
+            match call.function:
+                case SearchToolCallFunction(arguments=arguments):
+                    search_handler = self.search_handler
+                    assert search_handler is not None
+                    search_output = await search_handler(arguments)
+                    match search_output:
+                        case str() as result:
+                            pass
+                        case SearchToolOutput(result=result, debug_trace=debug_trace):
+                            self._search_debug_traces[call.id] = debug_trace
+                            delivery = ToolResultDelivery.DIRECT_SPEECH
+                case CalculateToolCallFunction(arguments=arguments):
+                    result = await self.calculate_handler(arguments)
+                case GetTimeToolCallFunction(arguments=arguments):
+                    result = await self.get_time_handler(arguments)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            return ToolExecutionFailure(
+                call_id=call.id,
+                tool_name=call.function.name,
+                reason=ToolExecutionFailureReason.HANDLER_FAILURE,
+                message=f"{call.function.name} failed: {error}",
+            )
+        return ToolSuccess(
+            call_id=call.id,
+            tool_name=call.function.name,
+            result=result,
+            delivery=delivery,
+        )
+
+
+class StandardSearchHandler:
+    def __init__(self, answerer: SearchAnswerer) -> None:
+        self.answerer = answerer
+
+    async def __call__(self, arguments: SearchArguments) -> str | SearchToolOutput:
+        return await self.answerer.answer(arguments.query)
+
+
+class PythonArithmeticHandler:
+    async def __call__(self, arguments: CalculateArguments) -> str:
+        expression = ast.parse(arguments.expression, mode="eval")
+        if isinstance(expression.body, ast.Tuple):
+            if not 1 < len(expression.body.elts) <= MAXIMUM_CALCULATION_RESULTS:
+                raise ValueError("A calculation list must contain between two and eight results.")
+            return ", ".join(str(_evaluate_arithmetic(item)) for item in expression.body.elts)
+        return str(_evaluate_arithmetic(expression.body))
+
+
+class CurrentLocalTimeHandler:
+    def __init__(self, current_time: CurrentTimeProvider) -> None:
+        self.current_time = current_time
+        self.local_time_zone = ZoneInfo("Etc/UTC")
+
+    def set_local_time_zone(self, time_zone_name: str) -> None:
+        self.local_time_zone = ZoneInfo(time_zone_name)
+
+    async def __call__(self, arguments: GetTimeArguments) -> str:
+        current_time = self.current_time()
+        if current_time.utcoffset() is None:
+            raise ValueError("Current time must include a UTC offset.")
+        time_zones = (
+            tuple(ZoneInfo(name) for name in arguments.time_zone_names)
+            if arguments.time_zone_names
+            else (self.local_time_zone,)
+        )
+        return "\n".join(_time_in_zone(current_time, time_zone) for time_zone in time_zones)
+
+
+def create_runtime_tool_registry(
+    search_handler: SearchToolHandler | None,
+) -> RuntimeToolRegistry:
+    return RuntimeToolRegistry(
+        search_handler=search_handler,
+        calculate_handler=PythonArithmeticHandler(),
+        get_time_handler=CurrentLocalTimeHandler(_current_local_time),
+    )
+
+
+def runtime_tool_specifications() -> tuple[ToolSpecification, ...]:
+    return _tool_specifications()
+
+
+def _tool_specifications() -> tuple[ToolSpecification, ...]:
+    return (
+        ToolSpecification(
+            function=SearchToolFunctionSpecification(
+                description=(
+                    "Search for current or externally verifiable information. This call is "
+                    "required for current weather or news and when the user asks to search, look "
+                    "up, check, browse, or make a tool call for external information. Call it now "
+                    "instead of promising a future search or asking the user to check elsewhere. "
+                    "Also call it to verify a niche factual claim when the user challenges the "
+                    "assistant's answer or supplies contrary firsthand evidence."
+                ),
+                parameters=SearchParameters(
+                    properties=SearchParameterProperties(
+                        query=ToolStringParameter(description="A concise search query.")
+                    )
+                ),
+            )
+        ),
+        ToolSpecification(
+            function=CalculateToolFunctionSpecification(
+                description=(
+                    "Evaluate a basic numeric arithmetic expression. Use it for requested exact "
+                    "arithmetic, comparisons, totals, and unit conversions."
+                ),
+                parameters=CalculateParameters(
+                    properties=CalculateParameterProperties(
+                        expression=ToolStringParameter(
+                            description="Numeric literals and basic arithmetic operators."
+                        )
+                    )
+                ),
+            )
+        ),
+        ToolSpecification(
+            function=GetTimeToolFunctionSpecification(
+                description=(
+                    "Get the current date and time. Omit time_zone_names for the user's browser "
+                    "local time, or provide one or more IANA time-zone names in a single call "
+                    "to compare places, for example Europe/London and America/New_York."
+                ),
+                parameters=GetTimeParameters(
+                    properties=GetTimeParameterProperties(
+                        time_zone_names=ToolStringArrayParameter(
+                            items=ToolStringParameter(
+                                description="An IANA time-zone name such as Europe/London."
+                            ),
+                            description=(
+                                "IANA time-zone names to return together. Omit for browser-local "
+                                "time."
+                            ),
+                        )
+                    )
+                ),
+            )
+        ),
+    )
+
+
+def _current_local_time() -> datetime:
+    return datetime.now(UTC)
+
+
+def _time_in_zone(current_time: datetime, time_zone: ZoneInfo) -> str:
+    local_time = current_time.astimezone(time_zone)
+    return f"{local_time.isoformat(timespec='seconds')} (IANA time zone: {time_zone.key})"
+
+
+def _evaluate_arithmetic(expression: ast.expr) -> int | float:
+    match expression:
+        case ast.Constant(value=bool()):
+            raise ValueError("Boolean values are not arithmetic operands.")
+        case ast.Constant(value=int() as value):
+            return _bounded_integer(value)
+        case ast.Constant(value=float() as value):
+            return _bounded_float(value)
+        case ast.UnaryOp(op=ast.UAdd(), operand=operand):
+            return _evaluate_arithmetic(operand)
+        case ast.UnaryOp(op=ast.USub(), operand=operand):
+            value = _evaluate_arithmetic(operand)
+            return _bounded_number(-value)
+        case ast.BinOp(left=left, op=operator, right=right):
+            left_value = _evaluate_arithmetic(left)
+            right_value = _evaluate_arithmetic(right)
+            result: int | float
+            match operator:
+                case ast.Add():
+                    result = left_value + right_value
+                case ast.Sub():
+                    result = left_value - right_value
+                case ast.Mult():
+                    result = left_value * right_value
+                case ast.Div():
+                    result = left_value / right_value
+                case ast.FloorDiv():
+                    result = left_value // right_value
+                case ast.Mod():
+                    result = left_value % right_value
+                case ast.Pow():
+                    if abs(right_value) > MAXIMUM_ABSOLUTE_EXPONENT:
+                        raise ValueError("The exponent is too large.")
+                    result = left_value**right_value
+                case _:
+                    raise ValueError("The expression contains an unsupported operator.")
+            return _bounded_number(result)
+        case _:
+            raise ValueError("Only numeric literals and basic arithmetic operators are allowed.")
+
+
+def _bounded_number(value: int | float) -> int | float:
+    match value:
+        case bool():
+            raise ValueError("Boolean results are not supported.")
+        case int() as integer:
+            return _bounded_integer(integer)
+        case float() as decimal:
+            return _bounded_float(decimal)
+
+
+def _bounded_integer(value: int) -> int:
+    if abs(value) > MAXIMUM_ABSOLUTE_INTEGER_RESULT:
+        raise ValueError("The integer result is too large.")
+    return value
+
+
+def _bounded_float(value: float) -> float:
+    if not math.isfinite(value):
+        raise ValueError("The floating-point result must be finite.")
+    if abs(value) > MAXIMUM_ABSOLUTE_FLOAT_RESULT:
+        raise ValueError("The floating-point result is too large.")
+    return value

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#16615a" />
+    <meta name="description" content="A low-latency streaming voice agent with natural turn-taking, backchannels, interruptions, and tool use." />
+    <title>Voice Light · Streaming conversation demo</title>
+    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main>
+      <header class="site-header">
+        <a class="brand" href="https://github.com/BertilBraun/Voice-Light">
+          <span aria-hidden="true">VL</span>
+          Voice Light
+        </a>
+        <span id="connection-status" data-state="idle">Disconnected</span>
+      </header>
+
+      <section class="hero">
+        <p class="eyebrow">Streaming conversation research</p>
+        <h1>A voice agent that listens.</h1>
+        <p>Talk naturally, add a quick “mm-hmm,” or interrupt. Voice Light responds while keeping track of who has the floor.</p>
+      </section>
+
+      <section class="controls">
+        <div class="buttons">
+          <button id="start-button" type="button">Start microphone</button>
+          <button id="stop-button" type="button" disabled>Stop</button>
+        </div>
+        <div id="recording-review" class="recording-review" hidden>
+          <p>Exact 16 kHz microphone PCM sent over the WebSocket</p>
+          <audio id="recording-player" controls></audio>
+          <div class="recording-downloads">
+            <a id="recording-download" download>Download WAV</a>
+            <a id="trace-download" download>Download session trace</a>
+          </div>
+        </div>
+        <p id="session-guidance" data-state="idle" role="status" aria-live="polite">
+          Press Start microphone to wake the server.
+        </p>
+        <p class="privacy-notice">
+          For research and quality analysis, this demo privately stores microphone audio,
+          transcripts, assistant responses, tool activity, and timing data for up to 30 days.
+          Do not share sensitive information.
+        </p>
+      </section>
+
+      <section class="conversation" aria-labelledby="conversation-title">
+        <div class="conversation-heading">
+          <div>
+            <p class="eyebrow">Current session</p>
+            <h2 id="conversation-title">Conversation history</h2>
+          </div>
+          <div class="conversation-tools">
+            <label class="preview-toggle" for="generated-text-toggle">
+              <input id="generated-text-toggle" type="checkbox" />
+              Preview generated text
+            </label>
+            <div class="conversation-status" aria-label="Live conversation status">
+              <span>You <strong id="vad-status">waiting</strong></span>
+              <span>Assistant <strong id="playback-status">waiting</strong></span>
+            </div>
+          </div>
+        </div>
+        <div id="conversation-history" class="conversation-history" aria-live="polite">
+          <p id="conversation-empty" class="conversation-empty">
+            Your conversation will appear here as you speak.
+          </p>
+        </div>
+      </section>
+
+      <section class="interaction-debug" aria-labelledby="interaction-debug-title">
+        <div>
+          <p class="eyebrow">Ephemeral model evidence</p>
+          <h2 id="interaction-debug-title">How the agent reads the floor</h2>
+        </div>
+        <div class="interaction-timeline-heading">
+          <p>Last 20 seconds · dots are model observations, not conversation labels</p>
+          <div class="interaction-timeline-legend" aria-hidden="true">
+            <span data-series="yield">user yielded</span>
+            <span data-series="completion">turn complete</span>
+            <span data-series="floor">taking the floor</span>
+            <span data-series="feedback">backchannel</span>
+            <span data-series="rejected">hollow = stale or inapplicable</span>
+          </div>
+        </div>
+        <canvas
+          id="interaction-timeline"
+          class="interaction-timeline"
+          height="240"
+          role="img"
+          aria-label="Live Silero, assistant playback, and turn-taking probability timeline"
+        ></canvas>
+        <details class="policy-details">
+          <summary>Latest policy snapshot</summary>
+          <p class="policy-explanation">
+            These probabilities are causal evidence used by the hybrid policy. “User yielded” means
+            the user is not holding the floor; “taking the floor” means speech should interrupt the
+            assistant; “backchannel” means brief feedback that should let it continue.
+          </p>
+          <dl>
+            <div><dt>Adapter</dt><dd id="debug-adapter-status">waiting</dd></div>
+            <div><dt>Silero speech</dt><dd id="debug-silero">waiting</dd></div>
+            <div title="Broad HOLD/YIELD estimate used for speculation and commitment."><dt>User yielded</dt><dd id="debug-user-yield">—</dd></div>
+            <div title="Probability that the current conversational turn is complete."><dt>Turn complete</dt><dd id="debug-turn-completion">—</dd></div>
+            <div title="Probability that user speech intends to claim the floor during assistant playback."><dt>Taking the floor</dt><dd id="debug-floor-take">—</dd></div>
+            <div title="Probability that user speech is feedback which should not take the floor."><dt>Backchannel</dt><dd id="debug-non-floor">—</dd></div>
+            <div><dt>Final decision</dt><dd id="debug-policy-decision">waiting</dd></div>
+            <div><dt>Decision latency</dt><dd id="debug-policy-latency">—</dd></div>
+            <div><dt>First usable prediction</dt><dd id="debug-prediction-latency">—</dd></div>
+            <div><dt>Latest sample</dt><dd id="debug-prediction-disposition">—</dd></div>
+            <div><dt>Playback action</dt><dd id="debug-action-latency">—</dd></div>
+            <div><dt>Evidence cadence</dt><dd id="debug-evidence-cadence">no model observations</dd></div>
+          </dl>
+        </details>
+      </section>
+
+      <details>
+        <summary>Session events</summary>
+        <ol id="event-log"></ol>
+      </details>
+    </main>
+    <script type="module" src="./app.js?v=25"></script>
+  </body>
+</html>

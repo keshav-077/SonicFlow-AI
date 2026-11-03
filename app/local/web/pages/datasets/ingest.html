@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Voice Light Ingestion</title>
+    <link rel="stylesheet" href="/pages/datasets/ingest.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <header class="toolbar">
+        <div>
+          <h1>Dataset Ingestion</h1>
+          <p id="status">Ready</p>
+        </div>
+        <nav>
+          <a href="/">Home</a>
+          <a href="/datasets">Dashboard</a>
+        </nav>
+      </header>
+
+      <section class="panel">
+        <h2>S3 manifest ingestion</h2>
+        <p>
+          The manifest supplies immutable S3 object metadata. Credentials are resolved from the
+          compute node environment and are never persisted by Voice Light.
+        </p>
+        <form id="manifest-ingestion-form" class="ingestion-form">
+          <label>
+            Dataset name
+            <input id="manifest-dataset-name" type="text" value="meetings-s3" required />
+          </label>
+          <label>
+            Manifest path
+            <input
+              id="manifest-path"
+              type="text"
+              placeholder="C:\path\to\meetings-metadata.json"
+              required
+            />
+          </label>
+          <label>
+            Parallel workers
+            <input id="manifest-max-workers" type="number" value="1" min="1" max="4" />
+          </label>
+          <label>
+            Maximum new audio hours (optional)
+            <input
+              id="manifest-max-duration-hours"
+              type="number"
+              min="0.1"
+              step="0.1"
+            />
+          </label>
+          <button type="submit">Start manifest ingestion</button>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>Local folder ingestion</h2>
+        <form id="ingestion-form" class="ingestion-form">
+          <label>
+            Dataset name
+            <input id="dataset-name" name="dataset_name" type="text" value="dataset_1-local" required />
+          </label>
+          <label>
+            Root path
+            <input
+              id="root-path"
+              name="root_path"
+              type="text"
+              value="/app/data/dataset_1/samples"
+              required
+            />
+          </label>
+          <label>
+            Sample layout
+            <select id="dataset-layout" name="layout">
+              <option value="two_audio_files">Exactly two audio files</option>
+              <option value="mix_and_two_speakers">Mix and two speaker files</option>
+            </select>
+          </label>
+          <label>
+            Parallel workers
+            <input id="max-workers" name="max_workers" type="number" value="1" min="1" max="4" />
+          </label>
+          <label>
+            Maximum new audio hours (optional)
+            <input
+              id="max-duration-hours"
+              name="max_duration_hours"
+              type="number"
+              value="10"
+              min="0.1"
+              step="0.1"
+            />
+          </label>
+          <button type="submit">Start ingestion</button>
+        </form>
+        <pre id="error-output" class="error-output" hidden></pre>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <h2>Jobs</h2>
+          <button id="refresh-jobs" type="button">Refresh</button>
+        </div>
+        <div id="jobs-list" class="jobs-list"></div>
+      </section>
+    </main>
+    <script src="/pages/datasets/ingest.js"></script>
+  </body>
+</html>

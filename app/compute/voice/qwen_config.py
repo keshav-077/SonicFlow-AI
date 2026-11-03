@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+
+from app.compute.voice.model_constants import (
+    LANGUAGE_MODEL_ADAPTER_NAME,
+    LANGUAGE_MODEL_ADAPTER_REVISION,
+    LANGUAGE_MODEL_GPU_MEMORY_UTILIZATION,
+    LANGUAGE_MODEL_NAME,
+    LANGUAGE_MODEL_REVISION,
+    QWEN_MAXIMUM_MODEL_LENGTH,
+)
+
+MERGED_LANGUAGE_MODEL_NAME_ENVIRONMENT_VARIABLE = "VOICE_LIGHT_MERGED_LANGUAGE_MODEL_NAME"
+MERGED_LANGUAGE_MODEL_REVISION_ENVIRONMENT_VARIABLE = "VOICE_LIGHT_MERGED_LANGUAGE_MODEL_REVISION"
+QWEN_ENFORCE_EAGER_ENVIRONMENT_VARIABLE = "VOICE_LIGHT_QWEN_ENFORCE_EAGER"
+QWEN_BACKEND_ENVIRONMENT_VARIABLE = "VOICE_LIGHT_QWEN_BACKEND"
+HUGGING_FACE_REPOSITORY_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$"
+)
+HUGGING_FACE_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+
+@dataclass(frozen=True)
+class QwenAdapterConfiguration:
+    repository_id: str
+    revision: str
+
+
+class QwenBackend(StrEnum):
+    VLLM = "vllm"
+    TRANSFORMERS = "transformers"
+
+
+@dataclass(frozen=True)
+class QwenSamplingConfiguration:
+    temperature: float = 0.7
+    top_p: float = 0.8
+    top_k: int = 20
+
+    def __post_init__(self) -> None:
+        if self.temperature <= 0.0:
+            raise ValueError("Qwen sampling temperature must be positive.")
+        if not 0.0 < self.top_p <= 1.0:
+            raise ValueError("Qwen sampling top-p must be greater than zero and at most one.")
+        if self.top_k <= 0:
+            raise ValueError("Qwen sampling top-k must be positive.")
+
+
+@dataclass(frozen=True)
+class QwenModelConfiguration:
+    model_name: str
+    model_revision: str
+    adapter: QwenAdapterConfiguration | None
+    gpu_memory_utilization: float
+    maximum_model_length: int
+    enforce_eager: bool
+    backend: QwenBackend = QwenBackend.VLLM
+    sampling: QwenSamplingConfiguration = QwenSamplingConfiguration()
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.gpu_memory_utilization <= 1.0:
+            raise ValueError(
+                "Qwen GPU memory utilization must be greater than zero and at most one."
+            )
+        if self.maximum_model_length <= 0:
+            raise ValueError("Qwen maximum model length must be positive.")
+
+
+def language_model_configuration_from_environment(
+    environment: Mapping[str, str],
+) -> QwenModelConfiguration:
+    merged_model_name = environment.get(MERGED_LANGUAGE_MODEL_NAME_ENVIRONMENT_VARIABLE)
+    merged_model_revision = environment.get(MERGED_LANGUAGE_MODEL_REVISION_ENVIRONMENT_VARIABLE)
+    if (merged_model_name is None) != (merged_model_revision is None):
+        raise ValueError(
+            f"{MERGED_LANGUAGE_MODEL_NAME_ENVIRONMENT_VARIABLE} and "
+            f"{MERGED_LANGUAGE_MODEL_REVISION_ENVIRONMENT_VARIABLE} must be configured together."
+        )
+    if merged_model_name is not None and merged_model_revision is not None:
+        if not HUGGING_FACE_REPOSITORY_PATTERN.fullmatch(merged_model_name):
+            raise ValueError(
+                f"{MERGED_LANGUAGE_MODEL_NAME_ENVIRONMENT_VARIABLE} must have the form owner/model."
+            )
+        if not HUGGING_FACE_COMMIT_PATTERN.fullmatch(merged_model_revision):
+            raise ValueError(
+                f"{MERGED_LANGUAGE_MODEL_REVISION_ENVIRONMENT_VARIABLE} must be a 40-character "
+                "lowercase Hugging Face commit hash."
+            )
+        return QwenModelConfiguration(
+            model_name=merged_model_name,
+            model_revision=merged_model_revision,
+            adapter=None,
+            gpu_memory_utilization=LANGUAGE_MODEL_GPU_MEMORY_UTILIZATION,
+            maximum_model_length=QWEN_MAXIMUM_MODEL_LENGTH,
+            enforce_eager=qwen_enforce_eager_from_environment(environment),
+            backend=qwen_backend_from_environment(environment),
+        )
+    return QwenModelConfiguration(
+        model_name=LANGUAGE_MODEL_NAME,
+        model_revision=LANGUAGE_MODEL_REVISION,
+        adapter=QwenAdapterConfiguration(
+            repository_id=LANGUAGE_MODEL_ADAPTER_NAME,
+            revision=LANGUAGE_MODEL_ADAPTER_REVISION,
+        ),
+        gpu_memory_utilization=LANGUAGE_MODEL_GPU_MEMORY_UTILIZATION,
+        maximum_model_length=QWEN_MAXIMUM_MODEL_LENGTH,
+        enforce_eager=qwen_enforce_eager_from_environment(environment),
+        backend=qwen_backend_from_environment(environment),
+    )
+
+
+def qwen_enforce_eager_from_environment(environment: Mapping[str, str]) -> bool:
+    value = environment.get(QWEN_ENFORCE_EAGER_ENVIRONMENT_VARIABLE, "false").strip().lower()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError(f"{QWEN_ENFORCE_EAGER_ENVIRONMENT_VARIABLE} must be true or false.")
+
+
+def qwen_backend_from_environment(environment: Mapping[str, str]) -> QwenBackend:
+    value = environment.get(QWEN_BACKEND_ENVIRONMENT_VARIABLE, QwenBackend.VLLM.value)
+    try:
+        return QwenBackend(value.strip().lower())
+    except ValueError as error:
+        supported = ", ".join(backend.value for backend in QwenBackend)
+        raise ValueError(
+            f"{QWEN_BACKEND_ENVIRONMENT_VARIABLE} must be one of: {supported}."
+        ) from error

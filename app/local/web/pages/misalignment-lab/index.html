@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Misalignment Lab - Voice Light</title>
+    <link rel="stylesheet" href="/pages/misalignment-lab/styles.css?v=8" />
+  </head>
+  <body>
+    <main>
+      <header class="page-header">
+        <div>
+          <a class="back-link" href="/training/sample-lab">&larr; Training sample lab</a>
+          <h1>Misalignment lab</h1>
+          <p>
+            Triage raw clips or compare conservative piecewise repair estimates for quarantined
+            conversations.
+          </p>
+        </div>
+        <div id="queue-position" class="queue-position">Loading queue...</div>
+      </header>
+
+      <nav class="mode-switch" aria-label="Misalignment lab mode">
+        <button id="triage-mode" type="button">Review new clips</button>
+        <button id="repair-mode" type="button">Test quarantine repairs</button>
+        <button id="global-countercheck-mode" type="button">Recheck provisional global shifts</button>
+      </nav>
+
+      <section class="panel progress-panel">
+        <div>
+          <span id="reviewed-label" class="label">Reviewed</span>
+          <strong id="reviewed-count">0</strong>
+        </div>
+        <div>
+          <span id="aligned-label" class="label">Plausibly aligned</span>
+          <strong id="aligned-count">0</strong>
+        </div>
+        <div>
+          <span id="quarantined-label" class="label">Quarantined sessions</span>
+          <strong id="quarantined-count">0</strong>
+        </div>
+        <div>
+          <span id="unsure-label" class="label">Unsure</span>
+          <strong id="unsure-count">0</strong>
+        </div>
+      </section>
+
+      <section id="empty-state" class="panel empty-state" hidden></section>
+
+      <section id="review" hidden>
+        <section class="panel candidate-header">
+          <div>
+            <span id="sample-name" class="eyebrow"></span>
+            <h2 id="candidate-time"></h2>
+            <p id="candidate-reason"></p>
+            <p class="review-category-line">
+              <strong id="review-category"></strong>
+              <span id="review-category-summary"></span>
+            </p>
+          </div>
+          <span id="shift-badge" class="raw-badge">Raw tracks - shift 0.0 s</span>
+        </section>
+
+        <section class="panel playback-panel">
+          <div id="global-window-controls" class="global-window-controls" hidden>
+            <div>
+              <strong>Countercheck location</strong>
+              <span>Use both locations before assigning a repair scope.</span>
+            </div>
+            <div class="comparison-buttons">
+              <button id="beginning-window" type="button" aria-pressed="true">
+                Beginning (first 3 min)
+              </button>
+              <button id="ending-window" type="button" aria-pressed="false">
+                End of recording
+              </button>
+            </div>
+          </div>
+          <div id="comparison-controls" class="comparison-controls" hidden>
+            <div>
+              <strong>Speaker 2 alignment</strong>
+              <span id="repair-evidence"></span>
+            </div>
+            <div class="comparison-buttons">
+              <button id="original-shift" type="button" aria-pressed="true">
+                Original 0.0 s <kbd>O</kbd>
+              </button>
+              <button id="predicted-shift" type="button" aria-pressed="false">
+                Try recommended <span id="predicted-shift-label"></span> <kbd>P</kbd>
+              </button>
+              <button id="recommended-fixes" type="button" class="aligned" hidden>
+                Recommended shift fixes it <kbd>F</kbd>
+              </button>
+            </div>
+          </div>
+          <div class="playback-controls">
+            <button id="play" type="button" class="primary">Start / replay both</button>
+            <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Clip position" />
+            <span id="clock" class="clock">0:00.0 / 0:20.0</span>
+          </div>
+          <p id="playback-status" class="playback-status">
+            Both WAV windows are decoded and scheduled on one audio clock.
+          </p>
+          <div id="tracks" class="tracks">
+            <article class="track">
+              <div class="track-heading">
+                <strong>Speaker 1</strong>
+                <span id="speaker1-events"></span>
+              </div>
+              <canvas id="speaker1-timeline" height="132"></canvas>
+            </article>
+            <article class="track">
+              <div class="track-heading">
+                <strong>Speaker 2</strong>
+                <span id="speaker2-events"></span>
+              </div>
+              <canvas id="speaker2-timeline" height="132"></canvas>
+            </article>
+          </div>
+          <div class="legend">
+            <span><i class="wave-swatch"></i>raw waveform</span>
+            <span><i class="turn-swatch"></i>turn-favoring segment</span>
+            <span><i class="keep-swatch"></i>backchannel / keep-playing</span>
+            <span><i class="pause-swatch"></i>pause / connection</span>
+            <span><i class="eot-swatch"></i>end of turn</span>
+          </div>
+        </section>
+
+        <section id="transition-review" class="panel transition-panel" hidden>
+          <div class="transition-heading">
+            <div>
+              <span class="eyebrow">Required for reconstruction</span>
+              <h3>Locate the alignment change</h3>
+              <p id="transition-summary"></p>
+            </div>
+            <span id="transition-marker-time" class="transition-time"></span>
+          </div>
+          <label for="transition-marker">
+            Proposed change point inside the orange audit interval
+          </label>
+          <input id="transition-marker" type="range" step="1" />
+          <div class="transition-range-labels">
+            <span id="transition-range-start"></span>
+            <span id="transition-range-end"></span>
+          </div>
+          <div class="transition-window-controls">
+            <button id="transition-earlier-window" type="button">&larr; Earlier 60 s</button>
+            <strong id="transition-window-label"></strong>
+            <button id="transition-later-window" type="button">Later 60 s &rarr;</button>
+          </div>
+          <div class="comparison-controls transition-comparison">
+            <div>
+              <strong>Two-minute transition replay</strong>
+              <span>Before the marker uses the early alignment; after it uses the verified late shift.</span>
+            </div>
+            <div class="comparison-buttons">
+              <button id="transition-raw" type="button" aria-pressed="true">Raw timeline</button>
+              <button id="transition-early" type="button" aria-pressed="false">
+                Early shift throughout
+              </button>
+              <button id="transition-late" type="button" aria-pressed="false">
+                Late shift throughout
+              </button>
+              <button id="transition-repaired" type="button" aria-pressed="false">
+                Piecewise repair
+              </button>
+            </div>
+          </div>
+          <div class="playback-controls">
+            <button id="transition-play" type="button" class="primary">Replay transition</button>
+            <input
+              id="transition-seek"
+              type="range"
+              min="0"
+              max="1000"
+              value="0"
+              aria-label="Transition clip position"
+            />
+            <span id="transition-clock" class="clock">0:00.0 / 2:00.0</span>
+          </div>
+          <p id="transition-status" class="playback-status"></p>
+          <div class="tracks">
+            <article class="track">
+              <div class="track-heading"><strong>Speaker 1</strong></div>
+              <canvas id="transition-speaker1-timeline" height="132"></canvas>
+            </article>
+            <article class="track">
+              <div class="track-heading"><strong>Speaker 2</strong></div>
+              <canvas id="transition-speaker2-timeline" height="132"></canvas>
+            </article>
+          </div>
+          <div class="legend">
+            <span><i class="transition-swatch"></i>estimated change interval</span>
+            <span><i class="marker-swatch"></i>selected reconstruction boundary</span>
+          </div>
+          <div class="decision-buttons transition-decisions">
+            <button id="transition-confirm" type="button" class="aligned">
+              Save this transition
+            </button>
+            <button id="transition-reject" type="button" class="misaligned">
+              No single transition
+            </button>
+            <button id="transition-cancel" type="button">Back to end check</button>
+          </div>
+        </section>
+
+        <section class="panel decision-panel">
+          <h3 id="decision-title">Do the two raw tracks plausibly share one timeline?</h3>
+          <p id="decision-description">
+            Plausibly aligned accepts the recording; likely misaligned quarantines it. Unsure asks
+            for a different exchange later. No audio is rewritten.
+          </p>
+          <div id="triage-decisions" class="decision-buttons">
+            <button id="aligned" type="button" class="aligned">
+              Plausibly aligned <kbd>A</kbd>
+            </button>
+            <button id="misaligned" type="button" class="misaligned">
+              Likely misaligned <kbd>M</kbd>
+            </button>
+            <button id="unsure" type="button">
+              Skip / unsure <kbd>U</kbd>
+            </button>
+          </div>
+          <div id="repair-decisions" class="decision-buttons" hidden>
+            <button id="repair-plausible" type="button" class="aligned">
+              Prediction sounds plausible <kbd>F</kbd>
+            </button>
+            <button id="repair-rejected" type="button" class="misaligned">
+              Prediction does not fix it <kbd>N</kbd>
+            </button>
+            <button id="repair-unsure" type="button">
+              Unsure <kbd>U</kbd>
+            </button>
+          </div>
+          <div id="global-countercheck-decisions" class="decision-buttons" hidden>
+            <button id="global-needs-transition" type="button" class="aligned">
+              Raw start + shifted end: needs transition
+            </button>
+            <button id="global-confirmed" type="button">
+              Shift works at both: truly global
+            </button>
+            <button id="global-not-repairable" type="button" class="misaligned">
+              Neither pattern is reliable
+            </button>
+            <button id="global-unsure" type="button">
+              Unsure
+            </button>
+          </div>
+        </section>
+
+        <section class="panel detail-panel">
+          <h3>Why this clip was sampled</h3>
+          <dl id="candidate-details"></dl>
+          <p class="note">
+            Synchronization estimators only influence sampling probability. The decision is based
+            on what you hear and see here; VAD and ASR agreement is not treated as independent
+            proof.
+          </p>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="/pages/misalignment-lab/app.js?v=10"></script>
+  </body>
+</html>

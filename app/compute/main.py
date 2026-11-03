@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import Annotated
+from uuid import uuid4
+
+from fastapi import Depends, FastAPI, File, Form, Response, UploadFile, WebSocket
+from starlette.requests import Request
+from starlette.responses import Response as StarletteResponse
+
+from app.compute.asr.service import transcribe_request, transcribe_uploaded_request
+from app.compute.auth import BearerTokenAuthorizer
+from app.compute.config import ComputeSettings
+from app.compute.dataset_audio import (
+    analyze_dataset_language,
+    analyze_dataset_quality,
+    transcribe_dataset_audio,
+)
+from app.compute.quality.router import analyze_uploaded_quality
+from app.compute.runtime import ComputeRuntime
+from app.compute.telemetry import RequestIdScope, configure_logging, gpu_memory
+from app.compute.voice.client_metadata import create_voice_client_metadata
+from app.compute.voice.router import run_voice_session
+from app.shared.asr import RemoteAsrRequest, RemoteAsrResponse
+from app.shared.compute_api import (
+    DatasetAsrRequest,
+    DatasetAsrResponse,
+    DatasetLanguageRequest,
+    DatasetLanguageResponse,
+    DatasetQualityRequest,
+    DatasetQualityResponse,
+    HealthStatus,
+    LivenessResponse,
+    ReadinessResponse,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def create_compute_app(settings: ComputeSettings) -> FastAPI:
+    configure_logging(settings.log_directory)
+    runtime = create_compute_runtime(settings)
+    return create_compute_app_for_runtime(settings, runtime)
+
+
+def create_compute_runtime(settings: ComputeSettings) -> ComputeRuntime:
+    return ComputeRuntime(
+        voice_stack_settings=settings.voice_stack,
+        dataset_audio_cache_directory=settings.dataset_audio_cache_directory,
+    )
+
+
+def create_compute_app_for_runtime(
+    settings: ComputeSettings,
+    runtime: ComputeRuntime,
+) -> FastAPI:
+    authorizer = BearerTokenAuthorizer(settings.token)
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        del application
+        logger.info("compute server startup initiated")
+        if not runtime.model_loading_started:
+            runtime.start_loading()
+        try:
+            if settings.eager_model_loading:
+                await runtime.wait_until_loading_complete()
+            yield
+        finally:
+            logger.info("compute server graceful shutdown initiated")
+            await runtime.shutdown()
+
+    application = FastAPI(title="Voice Light Compute", lifespan=lifespan)
+
+    @application.middleware("http")
+    async def request_telemetry(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[StarletteResponse]],
+    ) -> StarletteResponse:
+        request_id = request.headers.get("x-request-id") or str(uuid4())
+        started = time.perf_counter()
+        with RequestIdScope(request_id):
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            logger.info(
+                "%s %s completed with %d in %.3f seconds",
+                request.method,
+                request.url.path,
+                response.status_code,
+                time.perf_counter() - started,
+            )
+            return response
+
+    @application.get("/health/live")
+    def liveness() -> LivenessResponse:
+        return LivenessResponse()
+
+    @application.get(
+        "/health/ready",
+        dependencies=[Depends(authorizer.authorize_http)],
+    )
+    def readiness(response: Response) -> ReadinessResponse:
+        if not runtime.ready:
+            response.status_code = 503
+        return ReadinessResponse(
+            status=HealthStatus.READY if runtime.ready else HealthStatus.NOT_READY,
+            stages=runtime.stages(),
+            gpu_memory=gpu_memory(),
+        )
+
+    @application.post(
+        "/v1/asr:batch",
+        dependencies=[Depends(authorizer.authorize_http)],
+    )
+    async def batch_asr(request: RemoteAsrRequest) -> RemoteAsrResponse:
+        return await asyncio.to_thread(transcribe_request, runtime.batch_asr_models, request)
+
+    @application.post(
+        "/v1/asr:batch-upload",
+        dependencies=[Depends(authorizer.authorize_http)],
+    )
+    async def batch_asr_upload(
+        request_json: Annotated[str, Form()],
+        audio: Annotated[UploadFile, File()],
+    ) -> RemoteAsrResponse:
+        return await transcribe_uploaded_request(
+            model_cache=runtime.batch_asr_models,
+            request_json=request_json,
+            audio=audio,
+        )
+
+    application.post(
+        "/v1/quality:analyze",
+        dependencies=[Depends(authorizer.authorize_http)],
+    )(analyze_uploaded_quality)
+
+    @application.post(
+        "/v1/dataset:language",
+        dependencies=[Depends(authorizer.authorize_http)],
+    )
+    async def dataset_language(request: DatasetLanguageRequest) -> DatasetLanguageResponse:
+        return await asyncio.to_thread(
+            analyze_dataset_language,
+            request,
+            runtime.dataset_audio_cache,
+            runtime.batch_asr_models,
+        )
+
+    @application.post(
+        "/v1/dataset:asr",
+        dependencies=[Depends(authorizer.authorize_http)],
+    )
+    async def dataset_asr(request: DatasetAsrRequest) -> DatasetAsrResponse:
+        return await asyncio.to_thread(
+            transcribe_dataset_audio,
+            request,
+            runtime.dataset_audio_cache,
+            runtime.batch_asr_models,
+        )
+
+    @application.post(
+        "/v1/dataset:quality",
+        dependencies=[Depends(authorizer.authorize_http)],
+    )
+    async def dataset_quality(request: DatasetQualityRequest) -> DatasetQualityResponse:
+        return await asyncio.to_thread(
+            analyze_dataset_quality,
+            request,
+            runtime.dataset_audio_cache,
+        )
+
+    @application.websocket("/v1/voice")
+    async def voice(websocket: WebSocket) -> None:
+        if not runtime.voice_ready:
+            reason = (
+                "Voice stack is disabled."
+                if not runtime.voice_enabled
+                else "Compute models are not ready."
+            )
+            await websocket.close(code=1013, reason=reason)
+            return
+        request_id = websocket.headers.get("x-request-id") or str(uuid4())
+        lease = runtime.try_admit_voice_session(request_id)
+        if lease is None:
+            logger.warning(
+                "voice session rejected because another session is active: request=%s active=%s",
+                request_id,
+                runtime.voice_session_admission.active_request_id,
+            )
+            await websocket.close(code=1013, reason="Another voice session is active. Retry later.")
+            return
+        try:
+            client_metadata = create_voice_client_metadata(
+                origin=websocket.headers.get("origin"),
+                user_agent=websocket.headers.get("user-agent"),
+                forwarded_for=websocket.headers.get("x-forwarded-for"),
+                peer_host=websocket.client.host if websocket.client is not None else None,
+                hash_key=settings.token,
+            )
+            await run_voice_session(
+                websocket=websocket,
+                runtime=runtime,
+                request_id=request_id,
+                client_metadata=client_metadata,
+            )
+        finally:
+            runtime.release_voice_session(lease)
+
+    return application
+
+
+def create_app_from_environment() -> FastAPI:
+    return create_compute_app(ComputeSettings.from_environment(os.environ))

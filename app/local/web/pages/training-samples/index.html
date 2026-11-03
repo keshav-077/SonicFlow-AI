@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Training Sample Lab · Voice Light</title>
+    <link rel="stylesheet" href="/pages/training-samples/styles.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <a class="back-link" href="/">← Voice Light</a>
+          <h1>Training sample lab</h1>
+          <p>Inspect the exact 20-second crop, target values, and loss masks before training.</p>
+          <a class="back-link" href="/training/misalignment-lab">
+            Open raw-track misalignment triage &rarr;
+          </a>
+        </div>
+        <div id="status" class="status">Loading annotated samples…</div>
+      </header>
+
+      <section class="panel controls" aria-label="Sample controls">
+        <label>
+          Dataset
+          <select id="dataset-select"></select>
+        </label>
+        <label class="sample-field">
+          Conversation
+          <select id="sample-select"></select>
+        </label>
+        <label>
+          User input track
+          <select id="user-side-select">
+            <option value="speaker2">Speaker 2</option>
+            <option value="speaker1">Speaker 1</option>
+          </select>
+        </label>
+        <label>
+          Start (seconds)
+          <input id="start-input" type="number" min="0" step="0.08" value="0" />
+        </label>
+        <label>
+          Minimum quality
+          <input
+            id="minimum-quality-input"
+            type="number"
+            min="0"
+            max="1"
+            step="0.05"
+            placeholder="Any"
+          />
+        </label>
+        <label>
+          Next-sample strategy
+          <select id="sampling-mode-select">
+            <option value="interesting" selected>Interesting</option>
+            <option value="random">Fully random</option>
+          </select>
+        </label>
+        <label class="play-both-option">
+          <input id="randomize-initial-input" type="checkbox" checked />
+          Random first conversation
+        </label>
+        <button id="load-button" type="button">Load location</button>
+        <button id="random-button" type="button">Random location</button>
+        <button id="next-random-button" class="primary" type="button">Next sample</button>
+      </section>
+
+      <section class="panel position-panel">
+        <div class="position-heading">
+          <strong id="position-label">No crop loaded</strong>
+          <span id="role-label"></span>
+        </div>
+        <input id="position-slider" type="range" min="0" max="0" step="0.08" value="0" />
+      </section>
+
+      <section class="panel transport">
+        <button id="play-button" type="button" disabled>Play user input</button>
+        <label class="play-both-option">
+          <input id="play-both-input" type="checkbox" />
+          Play both tracks
+        </label>
+        <span id="time-readout">00:00.00 / 00:20.00</span>
+        <span class="input-note">User audio plus the known assistant-speaking state are model inputs.</span>
+        <audio id="user-audio" preload="metadata"></audio>
+        <audio id="assistant-audio" preload="metadata"></audio>
+      </section>
+
+      <section id="review-decision-panel" class="panel review-decision-panel" hidden>
+        <div>
+          <h2>Pre-publication review decision</h2>
+          <p>Save separate judgments for what you heard, the source annotation, and the labels.</p>
+        </div>
+        <label>Audio <select id="review-audio-status"></select></label>
+        <label>Annotation <select id="review-annotation-status"></select></label>
+        <label>Training labels <select id="review-label-status"></select></label>
+        <label>Overall <select id="review-overall-status"></select></label>
+        <label class="review-notes-field">
+          Notes
+          <textarea id="review-notes" maxlength="4000" rows="3"></textarea>
+        </label>
+        <button id="save-review-button" class="primary" type="button">Save decision</button>
+        <a id="back-to-review-link" class="back-link" href="/training/corpus-review">
+          Back to review queue
+        </a>
+      </section>
+
+      <section class="panel annotation-panel">
+        <div class="timeline-header">
+          <div>
+            <h2>Source end-of-turn annotation</h2>
+            <p>
+              The exact stored annotation used to construct the targets above, cropped to the same
+              20 seconds. Both waveforms use the same automatic gain normalization as playback.
+            </p>
+          </div>
+          <div class="annotation-legend">
+            <span><i class="annotation-turn"></i>Turn-favoring segment</span>
+            <span><i class="annotation-keep"></i>Keep-playing / backchannel</span>
+            <span><i class="annotation-pause"></i>Continuation gap</span>
+            <span><i class="annotation-eot"></i>End of turn</span>
+          </div>
+        </div>
+        <div id="annotation-source" class="annotation-source">No annotation loaded</div>
+        <div class="canvas-shell">
+          <canvas id="annotation-timeline" height="270"></canvas>
+        </div>
+      </section>
+
+      <section class="panel timeline-panel">
+        <div class="timeline-header">
+          <div>
+            <h2>Frame preview</h2>
+            <p>Click or scrub to inspect the target and mask assigned to an individual frame.</p>
+          </div>
+          <div class="legend">
+            <span><i class="burn"></i>Burn-in</span>
+            <span><i class="condition"></i>Known assistant-state input</span>
+            <span><i class="positive"></i>Valid target</span>
+            <span><i class="probability"></i>Higher target value</span>
+            <span><i class="uncertain"></i>Uncertain / censored</span>
+            <span><i class="inactive"></i>No auxiliary label at this frame</span>
+            <span><i class="unusable"></i>Potentially unusable region</span>
+          </div>
+        </div>
+        <div class="canvas-shell">
+          <canvas id="timeline" height="660"></canvas>
+        </div>
+      </section>
+
+      <section class="panel context-panel">
+        <div class="timeline-header">
+          <div>
+            <h2>Conversation context</h2>
+            <p id="context-label">
+              Click to center the 20-second crop. Use the mouse wheel to zoom.
+            </p>
+          </div>
+          <div class="context-legend">
+            <span><i class="context-selection"></i>Selected 20 seconds</span>
+            <span><i class="context-unusable"></i>Potentially unusable</span>
+          </div>
+        </div>
+        <div class="canvas-shell context-canvas-shell">
+          <canvas
+            id="context-overview"
+            height="220"
+            aria-label="Zoomable waveform and annotation context"
+          ></canvas>
+        </div>
+      </section>
+
+      <section class="details-grid">
+        <article class="panel summary-card">
+          <h2>Crop summary</h2>
+          <dl id="summary"></dl>
+        </article>
+        <article class="panel frame-card">
+          <h2>Selected frame</h2>
+          <div id="frame-time" class="frame-time">Select a frame</div>
+          <dl id="frame-details"></dl>
+        </article>
+      </section>
+
+      <section class="panel info-card">
+        <h2>What this crop trains</h2>
+        <p>
+          <code>p_user_has_floor</code> and the known <code>p_assistant_has_floor</code> input are soft
+          turn-state estimates. Continuation pauses retain the floor at reduced confidence;
+          backchannels do not assert floor ownership. <code>p_user_yield</code> predicts that the
+          user will not hold the floor 500 ms ahead and is supervised only within 500 ms of a user
+          speech offset.
+        </p>
+        <p>
+          At runtime, the assistant-floor phase reads <code>p_user_has_floor</code> to hand control
+          to the user. Once the user owns the floor, the user-floor phase reads
+          <code>p_user_yield</code> to release it; the floor-state output does not veto that
+          transition. <code>p_assistant_backchannel</code> predicts an annotated assistant
+          backchannel during the next 200 ms, allowing a runtime policy to start generating it
+          before its acoustic onset. Only recurrent burn-in, censored lookahead, and unsupported
+          standalone audio-only regions remove runtime loss.
+        </p>
+      </section>
+
+      <section class="panel warning-card">
+        <h2>Auxiliary supervision</h2>
+        <p>
+          Future activity is a soft occupancy fraction for four future horizons, not a hard
+          speech/no-speech label and not a pause classifier. Continuation-pause and non-floor
+          feedback targets retain the source annotation's probability across the full annotated
+          span. Turn completion and floor take / interruption remain causal point targets on one
+          frame. Frames without an applicable auxiliary label are blank and contribute no
+          auxiliary loss. Ambiguous annotations, censored horizons, padding, and the four-second
+          recurrent burn-in contribute no loss.
+        </p>
+      </section>
+    </main>
+    <script type="module" src="/pages/training-samples/app.js"></script>
+  </body>
+</html>

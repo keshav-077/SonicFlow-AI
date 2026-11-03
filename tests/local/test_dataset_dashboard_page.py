@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.local.main import app
+
+
+@pytest.fixture(scope="module")
+def dashboard_script() -> Iterator[str]:
+    with TestClient(app) as client:
+        script_response = client.get("/pages/datasets/app.js")
+    assert script_response.status_code == 200
+    yield script_response.text
+
+
+@pytest.fixture(scope="module")
+def dashboard_page() -> Iterator[str]:
+    with TestClient(app) as client:
+        page_response = client.get("/datasets")
+    assert page_response.status_code == 200
+    yield page_response.text
+
+
+@pytest.mark.parametrize(
+    "metric_label",
+    (
+        "Analyzed samples",
+        "Invalid samples",
+        "Analyzed audio",
+        "Represented audio",
+        "Speech segments",
+        "Interactions",
+        "Turns",
+        "Turn takings",
+        "Pauses",
+        "Backchannels",
+        "Interruptions",
+        "Useful events",
+        "Overall weighted",
+        "Interaction",
+        "Timing",
+        "Audio",
+        "Conversation",
+        "Analyzed duration",
+        "Events / hour",
+        "Speaker balance",
+        "Speech",
+        "Silence",
+        "Overlap",
+        "Candidates / hour",
+        "Turns / hour",
+        "Responses / hour",
+        "Interruptions / hour",
+        "Backchannels / hour",
+        "Median segment",
+        "Median turn gap",
+        "Median pause",
+        "Median overlap",
+        "Tiny fragments",
+        "Long segments",
+        "Duration gap",
+        "Duration mismatch",
+        "Track correlation",
+        "Envelope correlation",
+        "Speaker 1 leakage",
+        "Speaker 2 leakage",
+    ),
+)
+def test_dataset_dashboard_explains_metric(metric_label: str, dashboard_script: str) -> None:
+    assert f'["{metric_label}", "' in dashboard_script
+    assert 'tooltip.role = "tooltip"' in dashboard_script
+
+
+@pytest.mark.parametrize(
+    "estimated_metric_label",
+    (
+        "Speech segments",
+        "Interactions",
+        "Turns",
+        "Turn takings",
+        "Pauses",
+        "Backchannels",
+        "Interruptions",
+        "Useful events",
+        "Represented duration",
+        "Scale factor",
+    ),
+)
+def test_dataset_dashboard_explains_estimated_metric(
+    estimated_metric_label: str,
+    dashboard_script: str,
+) -> None:
+    assert f'["{estimated_metric_label}", "' in dashboard_script
+    assert "estimatedMetricDescriptions" in dashboard_script
+
+
+@pytest.mark.parametrize(
+    "track_metric_label",
+    ("Score", "RMS", "Peak", "Clipping", "Near zero"),
+)
+def test_dataset_dashboard_explains_audio_track_metric(
+    track_metric_label: str,
+    dashboard_script: str,
+) -> None:
+    assert f'["{track_metric_label}", "' in dashboard_script
+    assert "audioTrackMetricDescriptions.get(label)" in dashboard_script
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    (
+        "turn_completion",
+        "pause",
+        "start_response",
+        "interruption",
+        "backchannel",
+        "overlap",
+    ),
+)
+def test_dataset_dashboard_explains_event_type(event_type: str, dashboard_script: str) -> None:
+    assert f'["{event_type}", "' in dashboard_script
+    assert "eventTypeDescriptions.get(eventType)" in dashboard_script
+
+
+def test_dataset_dashboard_shows_trimmed_annotations_and_full_recordings(
+    dashboard_script: str,
+) -> None:
+    assert 'from "/pages/shared/annotation-timeline.js"' in dashboard_script
+    assert '"First three minutes with ASR annotations"' in dashboard_script
+    assert 'title: "Full recordings"' in dashboard_script
+    assert 'trimmed ? "?trimmed=true"' in dashboard_script
+
+
+def test_dataset_dashboard_loads_compact_rows_and_exact_completeness(
+    dashboard_script: str,
+) -> None:
+    assert "/api/dataset-dashboard/sample-summaries" in dashboard_script
+    assert "/api/dataset-dashboard/completeness" in dashboard_script
+    assert "/api/dataset-dashboard/samples/${sampleSummary.sample.id}" in dashboard_script
+    assert '"Latest quality / annotation versions"' in dashboard_script
+    assert '"Latest full-recording transcripts"' in dashboard_script
+
+
+def test_dataset_dashboard_refreshes_cached_script_and_reports_load_failures(
+    dashboard_page: str,
+    dashboard_script: str,
+) -> None:
+    assert 'src="/pages/datasets/app.js?v=3"' in dashboard_page
+    assert "Could not load datasets: ${reason}. Use Refresh to retry." in dashboard_script
+
+
+def test_dataset_dashboard_shows_language_preflight_and_filter(
+    dashboard_page: str,
+    dashboard_script: str,
+) -> None:
+    assert 'id="language-filter"' in dashboard_page
+    assert '"Language preflight"' in dashboard_script
+    assert "assessment.transcript_text" in dashboard_script
+    assert "formatProbeWindows" in dashboard_script
+
+
+def test_dataset_dashboard_previews_tunable_silence_masking(
+    dashboard_script: str,
+) -> None:
+    assert '"Silence masking preview"' in dashboard_script
+    assert "minimumSilenceSeconds" in dashboard_script
+    assert "silenceMaskSegments" in dashboard_script
+    assert "This preview does not alter ingestion." in dashboard_script
+
+
+def test_dataset_dashboard_previews_conversation_structure(
+    dashboard_script: str,
+) -> None:
+    assert '"Conversation structure"' in dashboard_script
+    assert "conversationStructureRegions" in dashboard_script
+    assert '"gaming_like"' in dashboard_script
+    assert "not automatic exclusions" in dashboard_script
+
+
+def test_ingestion_page_supports_manifest_without_persisting_credentials() -> None:
+    with TestClient(app) as client:
+        page_response = client.get("/datasets/ingest")
+        script_response = client.get("/pages/datasets/ingest.js")
+
+    assert page_response.status_code == 200
+    assert script_response.status_code == 200
+    assert 'id="manifest-ingestion-form"' in page_response.text
+    assert "never persisted by Voice Light" in page_response.text
+    assert "/api/dataset-dashboard/ingest/manifest" in script_response.text

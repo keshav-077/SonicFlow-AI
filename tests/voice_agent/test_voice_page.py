@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+from app.local.main import app
+
+
+def test_voice_page_exposes_streaming_conversation_history() -> None:
+    with TestClient(app) as client:
+        page_response = client.get("/voice-agent")
+        script_response = client.get("/pages/voice-agent/app.js")
+        configuration_response = client.get("/pages/voice-agent/public-config.mjs")
+        evidence_response = client.get("/pages/voice-agent/interaction-evidence.mjs")
+        progress_response = client.get("/pages/voice-agent/spoken-text-progress.mjs")
+        capture_worklet_response = client.get("/pages/voice-agent/capture-worklet.js")
+        worklet_response = client.get("/pages/voice-agent/playback-worklet.js")
+        icon_response = client.get("/pages/voice-agent/icon.svg")
+
+    assert page_response.status_code == 200
+    assert progress_response.status_code == 200
+    assert configuration_response.status_code == 200
+    assert evidence_response.status_code == 200
+    assert icon_response.status_code == 200
+    assert icon_response.headers["content-type"].startswith("image/svg+xml")
+    assert 'rel="icon" href="./icon.svg"' in page_response.text
+    assert 'id="conversation-history"' in page_response.text
+    assert 'id="conversation-empty"' in page_response.text
+    assert 'id="recording-player"' in page_response.text
+    assert 'id="recording-download"' in page_response.text
+    assert 'id="trace-download"' in page_response.text
+    assert 'id="user-transcript"' not in page_response.text
+    assert 'id="assistant-transcript"' not in page_response.text
+    assert 'message.type === "turn.committed"' in script_response.text
+    assert 'message.type === "llm.history"' in script_response.text
+    assert 'message.type === "llm.model_request"' in script_response.text
+    assert 'message.type === "search.debug"' in script_response.text
+    assert 'id="debug-turn-completion"' in page_response.text
+    assert 'id="debug-user-yield"' in page_response.text
+    assert 'id="debug-floor-take"' in page_response.text
+    assert 'id="debug-non-floor"' in page_response.text
+    assert 'id="debug-adapter-status"' in page_response.text
+    assert 'id="debug-prediction-latency"' in page_response.text
+    assert 'id="debug-action-latency"' in page_response.text
+    assert 'id="debug-evidence-cadence"' in page_response.text
+    assert 'id="interaction-timeline"' in page_response.text
+    assert 'message.type === "speech_understanding.debug"' in script_response.text
+    assert "updateInteractionEvidence(message)" in script_response.text
+    assert "INTERACTION_TIMELINE_DURATION_MS = 20000" in evidence_response.text
+    assert 'message.type === "interaction_policy.debug"' in script_response.text
+    assert 'message.type === "interaction_action.debug"' in script_response.text
+    assert "console.table(message.results)" in script_response.text
+    assert '"Isolated Qwen summary / main-agent tool result"' in script_response.text
+    assert "console.table(message.messages)" in script_response.text
+    assert "messages: message.messages, tools: message.tools" in script_response.text
+    assert "recordedInputChunks.push(data.slice(0))" in script_response.text
+    assert "createPcmWav(recordedInputChunks, INPUT_SAMPLE_RATE)" in script_response.text
+    assert "new AudioContext({ sampleRate: INPUT_SAMPLE_RATE })" in script_response.text
+    assert "capture-worklet.js?v=2" in script_response.text
+    assert "processorOptions: { targetSampleRate: INPUT_SAMPLE_RATE }" in script_response.text
+    assert 'console.info("Voice input capture"' in script_response.text
+    assert 'message.type === "assistant.text.delta"' in script_response.text
+    assert 'message.type === "assistant.cancel"' in script_response.text
+    assert 'message.type === "assistant.audio.text_boundary"' in script_response.text
+    assert 'message.type === "assistant.latency"' in script_response.text
+    assert 'label: "response"' in script_response.text
+    assert 'id="generated-text-toggle"' in page_response.text
+    assert "PRODUCTION_VOICE_WEBSOCKET_URL" in configuration_response.text
+    assert "turn-latencies" in script_response.text
+    assert 'message.type === "playback.command"' in script_response.text
+    assert 'data.type === "playback.started"' in script_response.text
+    assert 'data.type === "boundary.started"' in script_response.text
+    assert 'data.type === "playback.acknowledgement"' in script_response.text
+    assert 'type: "playback.started"' in script_response.text
+    assert 'type: "playback.progress"' in script_response.text
+    assert 'type: "playback.acknowledgement"' in script_response.text
+    assert "turn-unspoken" in script_response.text
+    assert "textOffset: message.text_offset" in script_response.text
+    assert "this.sourceSamplePosition >= this.boundaries[0].startSample" in worklet_response.text
+    assert 'type: "boundary.started"' in worklet_response.text
+    assert 'type: "playback.started"' in worklet_response.text
+    assert 'case "playback.command":' in worklet_response.text
+    assert "PlaybackState.PAUSED_BUFFERED" in worklet_response.text
+    assert "new Int16Array(input.length)" in capture_worklet_response.text
+    assert "playback-worklet.js?v=9" in script_response.text
+    assert 'data.type === "playback.clock"' in script_response.text
+    assert "underrun_count: data.underrunCount" in script_response.text
+    assert 'id="playback-underruns"' not in page_response.text
+    assert "app.js?v=25" in page_response.text
+    assert 'recordSessionTraceEvent("server", message)' in script_response.text
+    assert 'recordSessionTraceEvent("client", message)' in script_response.text
+    assert "schema_version: 1" in script_response.text
+    assert 'message.type !== "speech_understanding.debug"' in script_response.text
+    assert "MAX_EVENT_LOG_ENTRIES = 200" in script_response.text
+    assert "scheduleInteractionTimelineDraw" in script_response.text
+    assert "dots are model observations, not conversation labels" in page_response.text
+    assert "modelObservationSamples(points, field)" in script_response.text
+    assert "contiguousModelObservationSegments(samples)" in script_response.text
+    assert 'sample.disposition === "applicable"' in script_response.text
+    assert "Intl.DateTimeFormat().resolvedOptions().timeZone" in script_response.text
+    assert "local_time_zone: LOCAL_TIME_ZONE" in script_response.text
+    assert 'from "./spoken-text-progress.mjs"' in script_response.text
+    assert "this.spokenOffset = Math.max(this.spokenOffset, offset)" in progress_response.text
+    assert "input[index]" in capture_worklet_response.text
+    assert "sourcePosition" not in capture_worklet_response.text

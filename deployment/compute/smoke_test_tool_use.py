@@ -1,0 +1,375 @@
+from __future__ import annotations
+
+import logging
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+
+from app.compute.voice.conversation import (
+    ModelAssistantMessage,
+    ModelMessage,
+    ModelToolMessage,
+    ModelUserMessage,
+)
+from app.compute.voice.hermes_tool_parser import (
+    HermesSpokenText,
+    HermesToolCallCompleted,
+    HermesToolCallFailed,
+    HermesToolCallParser,
+)
+from app.compute.voice.llm_worker_protocol import (
+    LlmAssistantMessage,
+    LlmEndEvent,
+    LlmSpokenTextDeltaEvent,
+    LlmToolCallEvent,
+    LlmToolCallFailureEvent,
+    LlmToolCallStartedEvent,
+    LlmToolMessage,
+    LlmUserMessage,
+    LlmWorkerErrorEvent,
+    StartLlmCommand,
+)
+from app.compute.voice.models import (
+    QWEN_PYTHON_PATH,
+    QwenWorkerConfiguration,
+    QwenWorkerProcess,
+)
+from app.compute.voice.qwen_config import language_model_configuration_from_environment
+from app.compute.voice.tool_routing import route_required_search_call
+from app.compute.voice.tools import (
+    CalculateArguments,
+    CalculateToolCallFunction,
+    SearchArguments,
+    SerializedToolCall,
+    ToolCall,
+    ToolCallFailure,
+    ToolName,
+    ToolSuccess,
+    create_runtime_tool_registry,
+    runtime_tool_specifications,
+)
+from app.shared.base_model import FrozenBaseModel
+
+
+class SmokeCase(StrEnum):
+    ORDINARY = "ordinary_no_tool"
+    CALCULATE = "calculate"
+    CALCULATE_CONVERSION = "calculate_conversion"
+    SEARCH = "search"
+    EXPLICIT_SEARCH_REQUEST = "explicit_search_request"
+    CONFIRMED_SEARCH_REQUEST = "confirmed_search_request"
+    DISPUTED_FACT_SEARCH = "disputed_fact_search"
+    POST_TOOL_CONTINUATION = "post_tool_continuation"
+
+
+@dataclass(frozen=True)
+class SmokeRequest:
+    case: SmokeCase
+    command: StartLlmCommand
+    expected_tool: ToolName | None
+
+
+class SmokeObservation(FrozenBaseModel):
+    case: SmokeCase
+    generated_text: str
+    spoken_text: str
+    generated_tools: tuple[str, ...]
+    routed_tools: tuple[str, ...]
+    parser_failures: tuple[str, ...]
+    passed: bool
+
+
+class ToolUseSmokeReport(FrozenBaseModel):
+    base_model: str
+    base_revision: str
+    adapter: str | None
+    adapter_revision: str | None
+    observations: tuple[SmokeObservation, ...]
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    configuration = tool_use_worker_configuration(os.environ)
+    worker = QwenWorkerProcess(QWEN_PYTHON_PATH, configuration)
+    try:
+        observations = tuple(
+            _run_worker_smoke_request(worker, smoke_request) for smoke_request in _smoke_requests()
+        )
+    finally:
+        worker.close()
+    adapter = configuration.model.adapter
+    report = ToolUseSmokeReport(
+        base_model=configuration.model.model_name,
+        base_revision=configuration.model.model_revision,
+        adapter=None if adapter is None else adapter.repository_id,
+        adapter_revision=None if adapter is None else adapter.revision,
+        observations=observations,
+    )
+    print(report.model_dump_json(indent=2))
+    failed_cases = tuple(observation.case for observation in observations if not observation.passed)
+    if failed_cases:
+        failed_case_names = ", ".join(failed_cases)
+        raise RuntimeError(f"Tool-use smoke test failed: {failed_case_names}")
+
+
+def tool_use_worker_configuration(
+    environment: Mapping[str, str],
+) -> QwenWorkerConfiguration:
+    return QwenWorkerConfiguration(
+        model=language_model_configuration_from_environment(environment),
+        component_name="Qwen language model",
+    )
+
+
+def _run_smoke_request(
+    generated_text: str,
+    smoke_request: SmokeRequest,
+) -> SmokeObservation:
+    parser = HermesToolCallParser(smoke_request.command.invocation_id)
+    parser_events = (*parser.add_text(generated_text), *parser.finish())
+    spoken_text = "".join(
+        event.text for event in parser_events if isinstance(event, HermesSpokenText)
+    ).strip()
+    generated_requests = tuple(
+        event.request for event in parser_events if isinstance(event, HermesToolCallCompleted)
+    )
+    parser_failures = tuple(
+        event.failure.message for event in parser_events if isinstance(event, HermesToolCallFailed)
+    )
+    registry = create_runtime_tool_registry(_unused_search)
+    routed_requests = _routed_requests(smoke_request, generated_requests)
+    effective_requests = (*generated_requests, *routed_requests)
+    validated_calls = tuple(registry.validate(request) for request in effective_requests)
+    expected_tools = (
+        () if smoke_request.expected_tool is None else (smoke_request.expected_tool.value,)
+    )
+    validation_failures = tuple(
+        call.message for call in validated_calls if isinstance(call, ToolCallFailure)
+    )
+    return SmokeObservation(
+        case=smoke_request.case,
+        generated_text=generated_text,
+        spoken_text=spoken_text,
+        generated_tools=tuple(request.name for request in effective_requests),
+        routed_tools=tuple(request.name for request in routed_requests),
+        parser_failures=(*parser_failures, *validation_failures),
+        passed=(
+            (bool(spoken_text) or smoke_request.expected_tool is not None)
+            and tuple(request.name for request in effective_requests) == expected_tools
+            and not parser_failures
+            and not validation_failures
+        ),
+    )
+
+
+def _run_worker_smoke_request(
+    worker: QwenWorkerProcess,
+    smoke_request: SmokeRequest,
+) -> SmokeObservation:
+    spoken_parts: list[str] = []
+    generated_requests: list[SerializedToolCall] = []
+    failures: list[str] = []
+    registry = create_runtime_tool_registry(_unused_search)
+    worker.send(smoke_request.command)
+    while True:
+        event = worker.read_event()
+        match event:
+            case LlmSpokenTextDeltaEvent(text=text):
+                spoken_parts.append(text)
+            case LlmToolCallStartedEvent():
+                pass
+            case LlmToolCallEvent(request=request):
+                generated_requests.append(request)
+                validated_call = registry.validate(request)
+                if isinstance(validated_call, ToolCallFailure):
+                    failures.append(validated_call.message)
+            case LlmToolCallFailureEvent(failure=failure):
+                failures.append(failure.message)
+            case LlmEndEvent():
+                break
+            case LlmWorkerErrorEvent(message=message):
+                raise RuntimeError(f"Tool-use smoke generation failed: {message}")
+            case _:
+                raise RuntimeError("Tool-use smoke generation returned an unexpected event.")
+    spoken_text = "".join(spoken_parts).strip()
+    expected_tools = (
+        () if smoke_request.expected_tool is None else (smoke_request.expected_tool.value,)
+    )
+    routed_requests = _routed_requests(smoke_request, tuple(generated_requests))
+    effective_requests = (*generated_requests, *routed_requests)
+    for request in routed_requests:
+        validated_call = registry.validate(request)
+        if isinstance(validated_call, ToolCallFailure):
+            failures.append(validated_call.message)
+    return SmokeObservation(
+        case=smoke_request.case,
+        generated_text=spoken_text,
+        spoken_text=spoken_text,
+        generated_tools=tuple(request.name for request in effective_requests),
+        routed_tools=tuple(request.name for request in routed_requests),
+        parser_failures=tuple(failures),
+        passed=(
+            (bool(spoken_text) or smoke_request.expected_tool is not None)
+            and tuple(request.name for request in effective_requests) == expected_tools
+            and not failures
+        ),
+    )
+
+
+def _routed_requests(
+    smoke_request: SmokeRequest,
+    generated_requests: tuple[SerializedToolCall, ...],
+) -> tuple[SerializedToolCall, ...]:
+    if generated_requests:
+        return ()
+    routed = route_required_search_call(
+        _model_messages(smoke_request.command),
+        smoke_request.command.tools,
+        smoke_request.command.invocation_id,
+    )
+    return () if routed is None else (routed.request,)
+
+
+def _model_messages(command: StartLlmCommand) -> tuple[ModelMessage, ...]:
+    messages: list[ModelMessage] = []
+    for message in command.messages:
+        match message:
+            case LlmUserMessage(content=content):
+                messages.append(ModelUserMessage(content=content))
+            case LlmAssistantMessage(content=content, tool_calls=tool_calls):
+                messages.append(ModelAssistantMessage(content=content, tool_calls=tool_calls))
+            case LlmToolMessage(tool_call_id=tool_call_id, content=content):
+                messages.append(ModelToolMessage(tool_call_id=tool_call_id, outcome=content))
+    return tuple(messages)
+
+
+async def _unused_search(arguments: SearchArguments) -> str:
+    del arguments
+    raise AssertionError("The smoke test validates calls without executing tools.")
+
+
+def _smoke_requests() -> tuple[SmokeRequest, ...]:
+    tools = runtime_tool_specifications()
+    calculate_call = ToolCall(
+        id="smoke-calculate",
+        function=CalculateToolCallFunction(arguments=CalculateArguments(expression="37 * 14")),
+    )
+    calculate_result = ToolSuccess(
+        call_id=calculate_call.id,
+        tool_name=ToolName.CALCULATE,
+        result="518",
+    )
+    return (
+        SmokeRequest(
+            case=SmokeCase.ORDINARY,
+            command=StartLlmCommand(
+                invocation_id=1,
+                assistant_generation_id=1,
+                messages=(
+                    LlmUserMessage(content="In one short sentence, wish me a calm afternoon."),
+                ),
+                tools=tools,
+            ),
+            expected_tool=None,
+        ),
+        SmokeRequest(
+            case=SmokeCase.CALCULATE,
+            command=StartLlmCommand(
+                invocation_id=2,
+                assistant_generation_id=2,
+                messages=(LlmUserMessage(content="What is 37 multiplied by 14?"),),
+                tools=tools,
+            ),
+            expected_tool=ToolName.CALCULATE,
+        ),
+        SmokeRequest(
+            case=SmokeCase.CALCULATE_CONVERSION,
+            command=StartLlmCommand(
+                invocation_id=8,
+                assistant_generation_id=8,
+                messages=(LlmUserMessage(content="Convert 20 kilometers per hour to knots."),),
+                tools=tools,
+            ),
+            expected_tool=ToolName.CALCULATE,
+        ),
+        SmokeRequest(
+            case=SmokeCase.SEARCH,
+            command=StartLlmCommand(
+                invocation_id=3,
+                assistant_generation_id=3,
+                messages=(LlmUserMessage(content="Search for the current weather in Berlin."),),
+                tools=tools,
+            ),
+            expected_tool=ToolName.SEARCH,
+        ),
+        SmokeRequest(
+            case=SmokeCase.EXPLICIT_SEARCH_REQUEST,
+            command=StartLlmCommand(
+                invocation_id=5,
+                assistant_generation_id=5,
+                messages=(
+                    LlmUserMessage(
+                        content=("Can you make a tool call to check the weather in London for me?")
+                    ),
+                ),
+                tools=tools,
+            ),
+            expected_tool=ToolName.SEARCH,
+        ),
+        SmokeRequest(
+            case=SmokeCase.CONFIRMED_SEARCH_REQUEST,
+            command=StartLlmCommand(
+                invocation_id=6,
+                assistant_generation_id=6,
+                messages=(
+                    LlmUserMessage(content="Tell me the current weather in London."),
+                    LlmAssistantMessage(content="I can look that up for you."),
+                    LlmUserMessage(content="Please do so."),
+                ),
+                tools=tools,
+            ),
+            expected_tool=ToolName.SEARCH,
+        ),
+        SmokeRequest(
+            case=SmokeCase.DISPUTED_FACT_SEARCH,
+            command=StartLlmCommand(
+                invocation_id=7,
+                assistant_generation_id=7,
+                messages=(
+                    LlmUserMessage(
+                        content=(
+                            "You said professional windsurfers cannot sail above 40 knots, but I "
+                            "have sailed in that wind and know speed sailors use stronger winds."
+                        )
+                    ),
+                ),
+                tools=tools,
+            ),
+            expected_tool=ToolName.SEARCH,
+        ),
+        SmokeRequest(
+            case=SmokeCase.POST_TOOL_CONTINUATION,
+            command=StartLlmCommand(
+                invocation_id=4,
+                assistant_generation_id=4,
+                messages=(
+                    LlmUserMessage(content="What is 37 multiplied by 14?"),
+                    LlmAssistantMessage(
+                        content="I'll calculate that.",
+                        tool_calls=(calculate_call,),
+                    ),
+                    LlmToolMessage(
+                        tool_call_id=calculate_call.id,
+                        content=calculate_result,
+                    ),
+                ),
+                tools=tools,
+            ),
+            expected_tool=None,
+        ),
+    )
+
+
+if __name__ == "__main__":
+    main()
